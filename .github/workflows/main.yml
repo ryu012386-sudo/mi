@@ -1,0 +1,30 @@
+name: build-dylib
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14        # Xcode 同梱、iphoneos SDK あり
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos -f clang
+
+      - name: Build dylib
+        run: make
+
+      - name: Verify arch & load command
+        run: |
+          file resetuuid.dylib
+          otool -L resetuuid.dylib
+          otool -l resetuuid.dylib | grep -A2 LC_ID_DYLIB
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: resetuuid-dylib
+          path: resetuuid.dylib
