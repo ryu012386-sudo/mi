@@ -53,24 +53,41 @@ static void reset_gate(void) {
         // トグル手段A：iOS設定アプリのスイッチ（Settings.bundle の Key）
         BOOL bySetting = [[NSUserDefaults standardUserDefaults] boolForKey:@"reset_on_next_launch"];
 
-        // トグル手段B：Documents/RESET_ON（ファイル/フォルダの有無）— 設定を使わない場合の代替
-        NSString *flag = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
-                          stringByAppendingPathComponent:@"RESET_ON"];
-        BOOL byFile = [fm fileExistsAtPath:flag];
+        NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
 
-        L(@"gate: setting=%d file=%d", bySetting, byFile);
+        // 手段B：Documents/RESET_ON（有無）— 1回だけリセット（モードB, 自動で消す）
+        NSString *flagOnce = [docs stringByAppendingPathComponent:@"RESET_ON"];
+        BOOL byFile = [fm fileExistsAtPath:flagOnce];
 
-        if (bySetting || byFile) {
-            L(@"ARMED -> wiping once");
+        // 手段C：Documents/RESET_EVERY（有無）— 冷起動ごとに毎回リセット（モードA, 消さず永続）
+        NSString *flagEvery = [docs stringByAppendingPathComponent:@"RESET_EVERY"];
+        BOOL byEvery = [fm fileExistsAtPath:flagEvery];
+
+        BOOL armed = (bySetting || byFile || byEvery);
+        L(@"gate: setting=%d once=%d every=%d armed=%d", bySetting, byFile, byEvery, armed);
+
+        if (armed) {
+            L(@"ARMED -> wiping");
             do_wipe();  // ← std の <bundleID>.plist を消すので設定スイッチは自動でOFFに戻る
             if (byFile) {
                 NSError *e = nil;
-                BOOL removed = [fm removeItemAtPath:flag error:&e];
-                L(@"disarm file: removed RESET_ON=%d (%@)", removed, e ? e.localizedDescription : @"ok");
+                BOOL removed = [fm removeItemAtPath:flagOnce error:&e];
+                L(@"disarm once: removed RESET_ON=%d (%@)", removed, e ? e.localizedDescription : @"ok");
             }
-            L(@"-> stable from next launch. Toggle ON again to reset again.");
+            if (byEvery) L(@"RESET_EVERY present -> will reset again on next cold launch");
+            L(@"-> done");
         } else {
             L(@"OFF: keep current device (stable/verified)");
         }
+
+        // ---- ログに頼らない確認用：毎起動 Documents に状態を追記 ----
+        NSString *status = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                            stringByAppendingPathComponent:@"uuidreset_status.txt"];
+        NSString *line = [NSString stringWithFormat:@"%@  setting=%d file=%d armed=%d  bundleID=%@\n",
+                          [NSDate date], bySetting, byFile, armed,
+                          [[NSBundle mainBundle] bundleIdentifier]];
+        NSString *prev = [NSString stringWithContentsOfFile:status encoding:NSUTF8StringEncoding error:nil];
+        NSString *out  = prev ? [prev stringByAppendingString:line] : line;
+        [out writeToFile:status atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
 }
