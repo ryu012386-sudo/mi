@@ -108,6 +108,32 @@ static NSData *bg_real_jpeg(UIImage *img) {
 }
 @end
 
+// ウィンドウ自身も素通しにしないと、空き領域のタッチをこのウィンドウが食ってアプリが無反応になる
+@interface MRVPassthroughWindow : UIWindow @end
+@implementation MRVPassthroughWindow
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    UIView *v = [super hitTest:p withEvent:e];
+    return v == self ? nil : v;   // window自身が返る=空き領域 → nilで下のアプリへ
+}
+@end
+
+// アプリのキーウィンドウの最前面VC（ここから present しないとモーダルがタップを受けない）
+static UIViewController *bg_top_vc(void) {
+    UIWindow *kw = nil;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if ([s isKindOfClass:UIWindowScene.class]) {
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                if (w.isKeyWindow) { kw = w; break; }
+            }
+        }
+        if (kw) break;
+    }
+    if (!kw) return nil;
+    UIViewController *vc = kw.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
 @interface MRVBGTool : UIViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property(nonatomic,strong) UIButton *btn;
 @end
@@ -139,9 +165,11 @@ static NSData *bg_real_jpeg(UIImage *img) {
 - (void)alert:(NSString *)t msg:(NSString *)m {
     UIAlertController *a = [UIAlertController alertControllerWithTitle:t message:m preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:a animated:YES completion:nil];
+    [(bg_top_vc() ?: self) presentViewController:a animated:YES completion:nil];
 }
 - (void)tap {
+    L(@"[bg] button tapped");
+    UIViewController *host = bg_top_vc() ?: self;
     BOOL on = [self swapOn];
     BOOL hasImg = [[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"custom_bg.jpg")];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"背景画像ツール"
@@ -151,9 +179,10 @@ static NSData *bg_real_jpeg(UIImage *img) {
     [ac addAction:[UIAlertAction actionWithTitle:@"ファイルから画像を選ぶ" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self pickFile]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:(on?@"差し替えを OFF にする":@"差し替えを ON にする") style:on?UIAlertActionStyleDestructive:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self setSwap:!on]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
-    ac.popoverPresentationController.sourceView = self.btn;      // iPad 必須
-    ac.popoverPresentationController.sourceRect = self.btn.bounds;
-    [self presentViewController:ac animated:YES completion:nil];
+    // iPad: popover のアンカーを host のビューに（別ウィンドウのボタンは使えない）
+    ac.popoverPresentationController.sourceView = host.view;
+    ac.popoverPresentationController.sourceRect = CGRectMake(40, 160, 1, 1);
+    [host presentViewController:ac animated:YES completion:nil];
 }
 - (void)pickPhoto {
     if (@available(iOS 14.0, *)) {
@@ -162,7 +191,7 @@ static NSData *bg_real_jpeg(UIImage *img) {
         cfg.filter = [PHPickerFilter imagesFilter];
         PHPickerViewController *pk = [[PHPickerViewController alloc] initWithConfiguration:cfg];
         pk.delegate = self;
-        [self presentViewController:pk animated:YES completion:nil];
+        [(bg_top_vc() ?: self) presentViewController:pk animated:YES completion:nil];
     } else {
         [self alert:@"非対応" msg:@"iOS 14 以上が必要です"];
     }
@@ -185,7 +214,7 @@ static NSData *bg_real_jpeg(UIImage *img) {
         dp = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[ @"public.image" ] inMode:UIDocumentPickerModeImport];
     }
     dp.delegate = self;
-    [self presentViewController:dp animated:YES completion:nil];
+    [(bg_top_vc() ?: self) presentViewController:dp animated:YES completion:nil];
 }
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSURL *u = urls.firstObject; if (!u) return;
@@ -215,7 +244,7 @@ static void bg_install_ui(void) {
             s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
     }
     if (!scene) return;   // まだ準備前。次の active で再試行
-    g_bgWindow = [[UIWindow alloc] initWithWindowScene:scene];
+    g_bgWindow = [[MRVPassthroughWindow alloc] initWithWindowScene:scene];
     g_bgWindow.frame = scene.coordinateSpace.bounds;
     g_bgWindow.windowLevel = UIWindowLevelAlert + 1;
     g_bgWindow.backgroundColor = UIColor.clearColor;
