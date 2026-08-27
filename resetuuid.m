@@ -129,7 +129,7 @@ static NSData *bg_real_jpeg(UIImage *img) {
 - (void)drag:(UIPanGestureRecognizer *)g {
     CGPoint t = [g translationInView:self.view];
     g.view.center = CGPointMake(g.view.center.x + t.x, g.view.center.y + t.y);
-    [g setTranslation:CGPointZero inView:self.view];
+    [g setTranslation:CGPointMake(0, 0) inView:self.view];
 }
 - (BOOL)swapOn { return [[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"BG_SWAP_ON")]; }
 - (void)setSwap:(BOOL)on {
