@@ -2,6 +2,9 @@
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
+#import <PhotosUI/PhotosUI.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 static void L(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -41,6 +44,184 @@ static void regenerate_fake_idfv(void) {   // リセット時に新しい偽IDFV
     [g_fakeIDFV writeToFile:docs_path(@"fake_idfv.txt")
                  atomically:YES encoding:NSUTF8StringEncoding error:nil];
     L(@"idfv: regenerated -> %@", g_fakeIDFV);
+}
+
+// ==== プロフィール背景 画像差し替えツール ====
+// Documents/BG_SWAP_ON がある時だけ、UIImage->JPEG/PNG 変換を
+// Documents/custom_bg.(jpg|jpeg|png|heic) の中身に差し替える。
+// 「背景に設定」を押す直前に BG_SWAP_ON を作り、設定後に消す運用。
+static BOOL bg_swap_on(void) {
+    return [[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"BG_SWAP_ON")];
+}
+static NSData *bg_custom_data(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *n in @[@"custom_bg.jpg", @"custom_bg.jpeg", @"custom_bg.png", @"custom_bg.heic"]) {
+        NSString *p = docs_path(n);
+        if ([fm fileExistsAtPath:p]) {
+            NSData *d = [NSData dataWithContentsOfFile:p];
+            if (d.length) return d;
+        }
+    }
+    return nil;
+}
+typedef NSData *(*jpeg_fn)(UIImage *, CGFloat);
+typedef NSData *(*png_fn)(UIImage *);
+
+static NSData *my_UIImageJPEGRepresentation(UIImage *img, CGFloat q) {
+    static jpeg_fn orig = NULL;
+    if (!orig) orig = (jpeg_fn)dlsym(RTLD_DEFAULT, "UIImageJPEGRepresentation");
+    if (bg_swap_on()) {
+        NSData *d = bg_custom_data();
+        if (d) { L(@"[bg] JPEG swapped -> custom %lu bytes", (unsigned long)d.length); return d; }
+    }
+    return orig ? orig(img, q) : nil;
+}
+static NSData *my_UIImagePNGRepresentation(UIImage *img) {
+    static png_fn orig = NULL;
+    if (!orig) orig = (png_fn)dlsym(RTLD_DEFAULT, "UIImagePNGRepresentation");
+    if (bg_swap_on()) {
+        NSData *d = bg_custom_data();
+        if (d) { L(@"[bg] PNG swapped -> custom %lu bytes", (unsigned long)d.length); return d; }
+    }
+    return orig ? orig(img) : nil;
+}
+__attribute__((used, section("__DATA,__interpose")))
+static const void *_ip_jpeg[2] = { (const void *)my_UIImageJPEGRepresentation,
+                                   (const void *)UIImageJPEGRepresentation };
+__attribute__((used, section("__DATA,__interpose")))
+static const void *_ip_png[2]  = { (const void *)my_UIImagePNGRepresentation,
+                                   (const void *)UIImagePNGRepresentation };
+
+// interpose を回避して“本物の”JPEGエンコードを使う（保存用）
+static NSData *bg_real_jpeg(UIImage *img) {
+    static jpeg_fn r = NULL;
+    if (!r) r = (jpeg_fn)dlsym(RTLD_DEFAULT, "UIImageJPEGRepresentation");
+    return r ? r(img, 0.95) : nil;
+}
+
+// ==== アプリ内フローティングUI ====
+@interface MRVPassthroughView : UIView @end
+@implementation MRVPassthroughView
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    UIView *v = [super hitTest:p withEvent:e];
+    return v == self ? nil : v;   // ボタン以外はアプリに素通し
+}
+@end
+
+@interface MRVBGTool : UIViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
+@property(nonatomic,strong) UIButton *btn;
+@end
+@implementation MRVBGTool
+- (void)loadView { self.view = [MRVPassthroughView new]; self.view.backgroundColor = UIColor.clearColor; }
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = CGRectMake(16, 140, 60, 40);
+    b.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+    [b setTitle:@"BG" forState:UIControlStateNormal];
+    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    b.layer.cornerRadius = 8;
+    [b addTarget:self action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
+    [b addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)]];
+    [self.view addSubview:b];
+    self.btn = b;
+}
+- (void)drag:(UIPanGestureRecognizer *)g {
+    CGPoint t = [g translationInView:self.view];
+    g.view.center = CGPointMake(g.view.center.x + t.x, g.view.center.y + t.y);
+    [g setTranslation:CGPointZero inView:self.view];
+}
+- (BOOL)swapOn { return [[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"BG_SWAP_ON")]; }
+- (void)setSwap:(BOOL)on {
+    if (on) [[NSData data] writeToFile:docs_path(@"BG_SWAP_ON") atomically:YES];
+    else    [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"BG_SWAP_ON") error:nil];
+}
+- (void)alert:(NSString *)t msg:(NSString *)m {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:t message:m preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+- (void)tap {
+    BOOL on = [self swapOn];
+    BOOL hasImg = [[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"custom_bg.jpg")];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"背景画像ツール"
+        message:[NSString stringWithFormat:@"差し替え: %@ / 画像: %@", on?@"ON":@"OFF", hasImg?@"設定済":@"未設定"]
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:@"アルバムから画像を選ぶ" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self pickPhoto]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"ファイルから画像を選ぶ" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self pickFile]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:(on?@"差し替えを OFF にする":@"差し替えを ON にする") style:on?UIAlertActionStyleDestructive:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self setSwap:!on]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
+    ac.popoverPresentationController.sourceView = self.btn;      // iPad 必須
+    ac.popoverPresentationController.sourceRect = self.btn.bounds;
+    [self presentViewController:ac animated:YES completion:nil];
+}
+- (void)pickPhoto {
+    if (@available(iOS 14.0, *)) {
+        PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+        cfg.selectionLimit = 1;
+        cfg.filter = [PHPickerFilter imagesFilter];
+        PHPickerViewController *pk = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+        pk.delegate = self;
+        [self presentViewController:pk animated:YES completion:nil];
+    } else {
+        [self alert:@"非対応" msg:@"iOS 14 以上が必要です"];
+    }
+}
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results API_AVAILABLE(ios(14.0)) {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    if (!results.count) return;
+    NSItemProvider *ip = results.firstObject.itemProvider;
+    if ([ip canLoadObjectOfClass:UIImage.class]) {
+        [ip loadObjectOfClass:UIImage.class completionHandler:^(id<NSItemProviderReading> obj, NSError *err){
+            if ([obj isKindOfClass:UIImage.class]) [self saveImage:(UIImage *)obj];
+        }];
+    }
+}
+- (void)pickFile {
+    UIDocumentPickerViewController *dp;
+    if (@available(iOS 14.0, *)) {
+        dp = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[ UTTypeImage ]];
+    } else {
+        dp = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[ @"public.image" ] inMode:UIDocumentPickerModeImport];
+    }
+    dp.delegate = self;
+    [self presentViewController:dp animated:YES completion:nil];
+}
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NSURL *u = urls.firstObject; if (!u) return;
+    BOOL sec = [u startAccessingSecurityScopedResource];
+    NSData *d = [NSData dataWithContentsOfURL:u];
+    if (sec) [u stopAccessingSecurityScopedResource];
+    UIImage *img = [UIImage imageWithData:d];
+    if (img) [self saveImage:img]; else [self alert:@"失敗" msg:@"画像を読めませんでした"];
+}
+- (void)saveImage:(UIImage *)img {
+    NSData *jpg = bg_real_jpeg(img);   // ← interpose を回避して本物でエンコード
+    BOOL ok = [jpg writeToFile:docs_path(@"custom_bg.jpg") atomically:YES];
+    L(@"[bg] saved custom_bg.jpg ok=%d bytes=%lu", ok, (unsigned long)jpg.length);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self setSwap:YES];   // 保存したら自動でONにする
+        [self alert:@"セット完了" msg:@"画像を保存し『差し替えON』にしました。クローゼットで背景に設定してください。設定後はもう一度BG→OFFにしてください。"];
+    });
+}
+@end
+
+static UIWindow *g_bgWindow = nil;
+static void bg_install_ui(void) {
+    if (g_bgWindow) return;
+    UIWindowScene *scene = nil;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if ([s isKindOfClass:UIWindowScene.class] &&
+            s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
+    }
+    if (!scene) return;   // まだ準備前。次の active で再試行
+    g_bgWindow = [[UIWindow alloc] initWithWindowScene:scene];
+    g_bgWindow.frame = scene.coordinateSpace.bounds;
+    g_bgWindow.windowLevel = UIWindowLevelAlert + 1;
+    g_bgWindow.backgroundColor = UIColor.clearColor;
+    g_bgWindow.rootViewController = [MRVBGTool new];
+    g_bgWindow.hidden = NO;
+    L(@"[bg] floating UI installed");
 }
 
 static void do_wipe(void) {
@@ -123,5 +304,12 @@ static void reset_gate(void) {
         [(prev ? [prev stringByAppendingString:line] : line)
             writeToFile:docs_path(@"uuidreset_status.txt")
              atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+        // アプリ起動後にフローティングUI(BGボタン)を設置
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidBecomeActiveNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *n){ bg_install_ui(); }];
     }
 }

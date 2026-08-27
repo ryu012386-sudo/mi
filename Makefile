@@ -3,7 +3,7 @@ SDK     := $(shell xcrun --sdk iphoneos --show-sdk-path)
 CC      := $(shell xcrun --sdk iphoneos -f clang)
 ARCHS   := -arch arm64
 MINVER  := -miphoneos-version-min=12.0
-FRAMEWORKS := -framework Foundation -framework Security -framework UIKit
+FRAMEWORKS := -framework Foundation -framework Security -framework UIKit -framework PhotosUI -framework UniformTypeIdentifiers
 
 $(NAME).dylib: $(NAME).m
 	$(CC) $(ARCHS) -isysroot "$(SDK)" $(MINVER) -fobjc-arc \
