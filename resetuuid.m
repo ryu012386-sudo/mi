@@ -138,11 +138,12 @@ static UIViewController *bg_top_vc(void) {
 @property(nonatomic,strong) UIButton *btn;
 @end
 @implementation MRVBGTool
-- (void)loadView { self.view = [MRVPassthroughView new]; self.view.backgroundColor = UIColor.clearColor; }
+- (void)loadView { self.view = [UIView new]; self.view.backgroundColor = UIColor.clearColor; }
 - (void)viewDidLoad {
     [super viewDidLoad];
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.frame = CGRectMake(16, 140, 60, 40);
+    b.frame = self.view.bounds;                       // 極小ウィンドウ全体を占める
+    b.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     b.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
     [b setTitle:@"BG" forState:UIControlStateNormal];
     [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
@@ -153,9 +154,11 @@ static UIViewController *bg_top_vc(void) {
     self.btn = b;
 }
 - (void)drag:(UIPanGestureRecognizer *)g {
-    CGPoint t = [g translationInView:self.view];
-    g.view.center = CGPointMake(g.view.center.x + t.x, g.view.center.y + t.y);
-    [g setTranslation:CGPointMake(0, 0) inView:self.view];
+    // 極小ウィンドウごと動かす（ボタンはウィンドウを埋めている）
+    UIWindow *w = self.view.window;
+    CGPoint t = [g translationInView:nil];
+    w.center = CGPointMake(w.center.x + t.x, w.center.y + t.y);
+    [g setTranslation:CGPointMake(0, 0) inView:nil];
 }
 - (BOOL)swapOn { return [[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"BG_SWAP_ON")]; }
 - (void)setSwap:(BOOL)on {
@@ -244,13 +247,14 @@ static void bg_install_ui(void) {
             s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
     }
     if (!scene) return;   // まだ準備前。次の active で再試行
-    g_bgWindow = [[MRVPassthroughWindow alloc] initWithWindowScene:scene];
-    g_bgWindow.frame = scene.coordinateSpace.bounds;
+    // ボタンサイズだけの極小ウィンドウ。画面の他所にはウィンドウが無い＝アプリが普通にタッチ受ける
+    g_bgWindow = [[UIWindow alloc] initWithWindowScene:scene];
+    g_bgWindow.frame = CGRectMake(16, 140, 60, 40);
     g_bgWindow.windowLevel = UIWindowLevelAlert + 1;
     g_bgWindow.backgroundColor = UIColor.clearColor;
     g_bgWindow.rootViewController = [MRVBGTool new];
     g_bgWindow.hidden = NO;
-    L(@"[bg] floating UI installed");
+    L(@"[bg] floating UI installed (small window)");
 }
 
 static void do_wipe(void) {
