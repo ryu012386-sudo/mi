@@ -117,19 +117,24 @@ static NSData *bg_real_jpeg(UIImage *img) {
 }
 @end
 
-// アプリのキーウィンドウの最前面VC（ここから present しないとモーダルがタップを受けない）
+static UIWindow *g_bgWindow;   // 前方宣言（自分の小窓を除外するため）
+
+// アプリ側(=自分の小窓以外)の最前面VC。ここから present しないとピッカーが小窓に潰れる
 static UIViewController *bg_top_vc(void) {
-    UIWindow *kw = nil;
+    UIWindowScene *scene = nil;
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-        if ([s isKindOfClass:UIWindowScene.class]) {
-            for (UIWindow *w in ((UIWindowScene *)s).windows) {
-                if (w.isKeyWindow) { kw = w; break; }
-            }
-        }
-        if (kw) break;
+        if ([s isKindOfClass:UIWindowScene.class] &&
+            s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
     }
-    if (!kw) return nil;
-    UIViewController *vc = kw.rootViewController;
+    if (!scene) return nil;
+    UIWindow *best = nil;
+    for (UIWindow *w in scene.windows) {
+        if (w == g_bgWindow || w.hidden) continue;   // 自分の小窓は除外
+        if (w.isKeyWindow) { best = w; break; }
+        if (!best || w.windowLevel >= best.windowLevel) best = w;
+    }
+    if (!best) return nil;
+    UIViewController *vc = best.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
 }
@@ -144,10 +149,13 @@ static UIViewController *bg_top_vc(void) {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     b.frame = self.view.bounds;                       // 極小ウィンドウ全体を占める
     b.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    b.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
-    [b setTitle:@"BG" forState:UIControlStateNormal];
+    b.backgroundColor = [UIColor colorWithRed:0.15 green:0.5 blue:1 alpha:0.95];
+    [b setTitle:@"🖼 背景" forState:UIControlStateNormal];
     [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    b.layer.cornerRadius = 8;
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    b.layer.cornerRadius = 12;
+    b.layer.borderWidth = 1.5;
+    b.layer.borderColor = UIColor.whiteColor.CGColor;
     [b addTarget:self action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
     [b addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)]];
     [self.view addSubview:b];
@@ -188,16 +196,20 @@ static UIViewController *bg_top_vc(void) {
     [host presentViewController:ac animated:YES completion:nil];
 }
 - (void)pickPhoto {
-    if (@available(iOS 14.0, *)) {
-        PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
-        cfg.selectionLimit = 1;
-        cfg.filter = [PHPickerFilter imagesFilter];
-        PHPickerViewController *pk = [[PHPickerViewController alloc] initWithConfiguration:cfg];
-        pk.delegate = self;
-        [(bg_top_vc() ?: self) presentViewController:pk animated:YES completion:nil];
-    } else {
-        [self alert:@"非対応" msg:@"iOS 14 以上が必要です"];
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{   // アクションシート dismiss 後に確実に出す
+        if (@available(iOS 14.0, *)) {
+            PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+            cfg.selectionLimit = 1;
+            cfg.filter = [PHPickerFilter imagesFilter];
+            PHPickerViewController *pk = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+            pk.delegate = self;
+            UIViewController *h = bg_top_vc();
+            L(@"[bg] present PHPicker on %@", h ? NSStringFromClass(h.class) : @"(nil!)");
+            [(h ?: self) presentViewController:pk animated:YES completion:nil];
+        } else {
+            [self alert:@"非対応" msg:@"iOS 14 以上が必要です"];
+        }
+    });
 }
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results API_AVAILABLE(ios(14.0)) {
     [picker dismissViewControllerAnimated:YES completion:nil];
@@ -217,7 +229,9 @@ static UIViewController *bg_top_vc(void) {
         dp = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[ @"public.image" ] inMode:UIDocumentPickerModeImport];
     }
     dp.delegate = self;
-    [(bg_top_vc() ?: self) presentViewController:dp animated:YES completion:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [(bg_top_vc() ?: self) presentViewController:dp animated:YES completion:nil];
+    });
 }
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSURL *u = urls.firstObject; if (!u) return;
@@ -249,7 +263,7 @@ static void bg_install_ui(void) {
     if (!scene) return;   // まだ準備前。次の active で再試行
     // ボタンサイズだけの極小ウィンドウ。画面の他所にはウィンドウが無い＝アプリが普通にタッチ受ける
     g_bgWindow = [[UIWindow alloc] initWithWindowScene:scene];
-    g_bgWindow.frame = CGRectMake(16, 140, 60, 40);
+    g_bgWindow.frame = CGRectMake(12, 130, 110, 48);
     g_bgWindow.windowLevel = UIWindowLevelAlert + 1;
     g_bgWindow.backgroundColor = UIColor.clearColor;
     g_bgWindow.rootViewController = [MRVBGTool new];
