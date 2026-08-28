@@ -67,38 +67,26 @@ static NSData *bg_custom_data(void) {
 typedef NSData *(*jpeg_fn)(UIImage *, CGFloat);
 typedef NSData *(*png_fn)(UIImage *);
 
-// interpose を確実に回避して“本物”の UIKitCore 実装を取得する
-static void *bg_real_sym(const char *name) {
-    static void *h = NULL;
-    if (!h) {
-        h = dlopen("/System/Library/PrivateFrameworks/UIKitCore.framework/UIKitCore",
-                   RTLD_NOLOAD | RTLD_LAZY);
-        if (!h) h = RTLD_DEFAULT;
-    }
-    return dlsym(h, name);
-}
-static __thread int g_bg_inside = 0;   // 再帰ガード（スタックオーバーフロー防止）
+static jpeg_fn g_real_jpeg = NULL;     // 本物（interpose の replacee から取得）
+static png_fn  g_real_png  = NULL;
+static __thread int g_bg_inside = 0;   // 再帰ガード
 
 static NSData *my_UIImageJPEGRepresentation(UIImage *img, CGFloat q) {
-    jpeg_fn orig = (jpeg_fn)bg_real_sym("UIImageJPEGRepresentation");
-    if (orig == (jpeg_fn)&my_UIImageJPEGRepresentation) orig = NULL;   // 自己参照→再帰遮断
     if (!g_bg_inside && bg_swap_on()) {
         NSData *d = bg_custom_data();
         if (d) { L(@"[bg] JPEG swapped -> custom %lu bytes", (unsigned long)d.length); return d; }
     }
-    if (!orig) return nil;
-    g_bg_inside++; NSData *r = orig(img, q); g_bg_inside--;
+    if (!g_real_jpeg) return nil;
+    g_bg_inside++; NSData *r = g_real_jpeg(img, q); g_bg_inside--;
     return r;
 }
 static NSData *my_UIImagePNGRepresentation(UIImage *img) {
-    png_fn orig = (png_fn)bg_real_sym("UIImagePNGRepresentation");
-    if (orig == (png_fn)&my_UIImagePNGRepresentation) orig = NULL;     // 自己参照→再帰遮断
     if (!g_bg_inside && bg_swap_on()) {
         NSData *d = bg_custom_data();
         if (d) { L(@"[bg] PNG swapped -> custom %lu bytes", (unsigned long)d.length); return d; }
     }
-    if (!orig) return nil;
-    g_bg_inside++; NSData *r = orig(img); g_bg_inside--;
+    if (!g_real_png) return nil;
+    g_bg_inside++; NSData *r = g_real_png(img); g_bg_inside--;
     return r;
 }
 __attribute__((used, section("__DATA,__interpose")))
@@ -108,10 +96,20 @@ __attribute__((used, section("__DATA,__interpose")))
 static const void *_ip_png[2]  = { (const void *)my_UIImagePNGRepresentation,
                                    (const void *)UIImagePNGRepresentation };
 
-// 保存用：必ず本物でエンコード
+// interpose の replacee(_ip_*[1]) には dyld が“本物”のアドレスを入れる。そこから取得。
+__attribute__((constructor))
+static void bg_resolve_reals(void) {
+    g_real_jpeg = (jpeg_fn)_ip_jpeg[1];
+    g_real_png  = (png_fn)_ip_png[1];
+    if (g_real_jpeg == (jpeg_fn)my_UIImageJPEGRepresentation) g_real_jpeg = NULL;  // 念のため自己参照防止
+    if (g_real_png  == (png_fn)my_UIImagePNGRepresentation)   g_real_png  = NULL;
+    NSLog(@"[uuid-reset] [bg] real jpeg=%p png=%p (self jpeg=%p)",
+          (void *)g_real_jpeg, (void *)g_real_png, (void *)my_UIImageJPEGRepresentation);
+}
+
+// 保存用：本物でエンコード
 static NSData *bg_real_jpeg(UIImage *img) {
-    jpeg_fn r = (jpeg_fn)bg_real_sym("UIImageJPEGRepresentation");
-    return r ? r(img, 0.95) : nil;
+    return g_real_jpeg ? g_real_jpeg(img, 0.95) : nil;
 }
 
 // ==== アプリ内フローティングUI ====
