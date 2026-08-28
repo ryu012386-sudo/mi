@@ -165,40 +165,56 @@ static NSArray<NSString *> *acc_list(void) {
     }
     return [r sortedArrayUsingSelector:@selector(compare:)];
 }
+// ★prefs は cfprefsd 管理なので、ファイル直書きでなく NSUserDefaults API 経由で保存/復元する
 static void acc_snapshot(NSString *name) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *slot = acc_slot(name);
     [fm removeItemAtPath:slot error:nil];
     NSString *sp = [slot stringByAppendingPathComponent:@"prefs"];
     [fm createDirectoryAtPath:sp withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *prefs = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
-    for (NSString *f in mirrativ_pref_files())
-        [fm copyItemAtPath:[prefs stringByAppendingPathComponent:f]
-                    toPath:[sp stringByAppendingPathComponent:f] error:nil];
+    NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+    for (NSString *f in mirrativ_pref_files()) {
+        NSString *domain = [f stringByDeletingPathExtension];
+        NSDictionary *dom = [u persistentDomainForName:domain];   // cfprefsd の生値
+        if (dom) [dom writeToFile:[sp stringByAppendingPathComponent:f] atomically:YES];
+    }
     [acc_dump_keychain() writeToFile:[slot stringByAppendingPathComponent:@"keychain.plist"] atomically:YES];
     if ([fm fileExistsAtPath:docs_path(@"fake_idfv.txt")])
         [fm copyItemAtPath:docs_path(@"fake_idfv.txt")
                     toPath:[slot stringByAppendingPathComponent:@"fake_idfv.txt"] error:nil];
-    L(@"[acc] snapshot saved: %@", name);
+    L(@"[acc] snapshot saved (cfprefsd): %@", name);
 }
 static BOOL acc_restore(NSString *name) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *slot = acc_slot(name); BOOL d = NO;
     if (![fm fileExistsAtPath:slot isDirectory:&d] || !d) return NO;
-    NSString *prefs = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
-    for (NSString *f in mirrativ_pref_files())
-        [fm removeItemAtPath:[prefs stringByAppendingPathComponent:f] error:nil];
+    NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
     NSString *sp = [slot stringByAppendingPathComponent:@"prefs"];
-    for (NSString *f in [fm contentsOfDirectoryAtPath:sp error:nil])
-        [fm copyItemAtPath:[sp stringByAppendingPathComponent:f]
-                    toPath:[prefs stringByAppendingPathComponent:f] error:nil];
+    NSArray *slotFiles = [fm contentsOfDirectoryAtPath:sp error:nil] ?: @[];
+    NSMutableSet *slotDomains = [NSMutableSet set];
+    for (NSString *f in slotFiles) if ([f hasSuffix:@".plist"]) [slotDomains addObject:[f stringByDeletingPathExtension]];
+
+    // 現在の mirrativ ドメインでスロットに無いものは削除（API経由でcfprefsd更新）
+    for (NSString *f in mirrativ_pref_files()) {
+        NSString *dom = [f stringByDeletingPathExtension];
+        if (![slotDomains containsObject:dom]) [u removePersistentDomainForName:dom];
+    }
+    // スロットのドメインを丸ごと流し込む
+    for (NSString *f in slotFiles) {
+        if (![f hasSuffix:@".plist"]) continue;
+        NSString *dom = [f stringByDeletingPathExtension];
+        NSDictionary *dd = [NSDictionary dictionaryWithContentsOfFile:[sp stringByAppendingPathComponent:f]];
+        if (dd) [u setPersistentDomain:dd forName:dom];
+    }
+    [u synchronize];
+
     NSArray *kc = [NSArray arrayWithContentsOfFile:[slot stringByAppendingPathComponent:@"keychain.plist"]];
     if (kc) acc_restore_keychain(kc);
     [fm removeItemAtPath:docs_path(@"fake_idfv.txt") error:nil];
     if ([fm fileExistsAtPath:[slot stringByAppendingPathComponent:@"fake_idfv.txt"]])
         [fm copyItemAtPath:[slot stringByAppendingPathComponent:@"fake_idfv.txt"]
                     toPath:docs_path(@"fake_idfv.txt") error:nil];
-    L(@"[acc] restored: %@", name);
+    L(@"[acc] restored (cfprefsd): %@", name);
     return YES;
 }
 // 起動時: 保留スロットがあれば復元（デバイスリセットより優先）
@@ -209,6 +225,27 @@ static BOOL acc_restore_pending(void) {
     [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_pending_account.txt") error:nil];
     if (!p.length) return NO;
     return acc_restore(p);
+}
+// 新規アカ作成の自動保存：リセット後、/me で垢が確立してからスナップショット
+static void acc_schedule_autosave(void) {
+    NSString *name = [[NSString stringWithContentsOfFile:docs_path(@"_autosave_name.txt")
+                                                encoding:NSUTF8StringEncoding error:nil]
+                      stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!name.length) return;
+    static BOOL scheduled = NO; if (scheduled) return; scheduled = YES;
+    void (^doSave)(void) = ^{
+        static BOOL done = NO; if (done) return; done = YES;
+        acc_snapshot(name);
+        [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_autosave_name.txt") error:nil];
+        L(@"[acc] auto-saved new account as: %@", name);
+    };
+    // アプリをバックグラウンドにした時、または30秒後（先着）に保存
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *n){ doSave(); }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ doSave(); });
 }
 
 // ==== アプリ内フローティングUI ====
@@ -302,7 +339,9 @@ static UIViewController *bg_top_vc(void) {
         message:nil preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"🖼 背景画像ツール" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self bgMenu]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"👥 アカウント切替" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self accMenu]; }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"🔄 デバイスリセット（今すぐ）" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){ [self deviceResetNow]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🔄 新規アカにする（自動ログイン）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self lightNewNow]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🆕 新規アカ作成（名前つき保存）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self newAccountNamed]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🧹 完全初期化（トラブル時）" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){ [self deviceResetNow]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
 }
@@ -315,9 +354,27 @@ static UIViewController *bg_top_vc(void) {
     [a addAction:[UIAlertAction actionWithTitle:@"あとで自分で再起動" style:UIAlertActionStyleCancel handler:nil]];
     [self present:a];
 }
+- (void)lightNewNow {
+    [[NSData data] writeToFile:docs_path(@"NEW_LIGHT") atomically:YES];   // 軽量：新UUIDのみ、設定は維持
+    [self confirmRelaunch:@"開き直すと、新しい匿名アカウントで自動ログイン状態になります（手動作成なし）。"];
+}
 - (void)deviceResetNow {
-    [[NSData data] writeToFile:docs_path(@"RESET_ON") atomically:YES];   // 次回起動で1回リセット
-    [self confirmRelaunch:@"次に開いた時に新しいデバイス（新規アカウント）になります。"];
+    [[NSData data] writeToFile:docs_path(@"RESET_ON") atomically:YES];   // 完全初期化（prefs全消し＝オンボーディングから）
+    [self confirmRelaunch:@"次に開いた時に完全初期化されます（初回起動状態）。通常は『新規アカにする』で十分です。"];
+}
+- (void)newAccountNamed {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"新規アカ作成（名前つき保存）" message:@"作る新アカのスロット名を入力" preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.placeholder = @"例: サブ2"; }];
+    [a addAction:[UIAlertAction actionWithTitle:@"作成" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){
+        NSString *name = [a.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        name = [name stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+        if (!name.length) { [self alert:@"失敗" msg:@"名前が空です"]; return; }
+        [[NSData data] writeToFile:docs_path(@"NEW_LIGHT") atomically:YES];           // 軽量：新規アカで自動ログイン
+        [name writeToFile:docs_path(@"_autosave_name.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil]; // 起動後に自動保存
+        [self confirmRelaunch:[NSString stringWithFormat:@"開き直すと新規アカで自動ログインし、少し使うと自動で「%@」に保存します。", name]];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:a];
 }
 - (void)bgMenu {
     BOOL on = [self swapOn];
@@ -452,6 +509,36 @@ static void bg_install_ui(void) {
     L(@"[bg] floating UI installed (small window)");
 }
 
+// 軽量リセット：deviceUUID だけ新しくして、オンボーディング/設定は残す。
+// → アプリは起動時 /me を新UUIDで叩き、新しい匿名アカで“自動ログイン済み”になる（手動生成不要）
+static void do_new_device_light(void) {
+    NSString *SUITE = @"group.com.dena.mirrativ.shared";
+    NSString *newUUID = [[NSUUID UUID] UUIDString];
+
+    // Keychain の deviceUUID を差し替え
+    SecItemDelete((__bridge CFDictionaryRef)@{ (__bridge id)kSecClass:(__bridge id)kSecClassGenericPassword,
+                                               (__bridge id)kSecAttrAccount:@"com.dena.mirrativ.uuid" });
+    SecItemAdd((__bridge CFDictionaryRef)@{ (__bridge id)kSecClass:(__bridge id)kSecClassGenericPassword,
+                                            (__bridge id)kSecAttrAccount:@"com.dena.mirrativ.uuid",
+                                            (__bridge id)kSecValueData:[newUUID dataUsingEncoding:NSUTF8StringEncoding] }, NULL);
+    // prefs の deviceUUID を差し替え（API経由でcfprefsd更新）
+    NSUserDefaults *std = [NSUserDefaults standardUserDefaults];
+    NSUserDefaults *grp = [[NSUserDefaults alloc] initWithSuiteName:SUITE];
+    [std setObject:newUUID forKey:@"deviceUUID"]; [std synchronize];
+    [grp setObject:newUUID forKey:@"deviceUUID"]; [grp synchronize];
+
+    // Cookie を消して旧セッションを切る
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *ck = [[NSHomeDirectory() stringByAppendingPathComponent:@"Library"] stringByAppendingPathComponent:@"Cookies"];
+    for (NSString *f in [fm contentsOfDirectoryAtPath:ck error:nil])
+        [fm removeItemAtPath:[ck stringByAppendingPathComponent:f] error:nil];
+    for (NSHTTPCookie *c in [[NSHTTPCookieStorage sharedHTTPCookieStorage].cookies copy])
+        [[NSHTTPCookieStorage sharedHTTPCookieStorage] deleteCookie:c];
+
+    regenerate_fake_idfv();
+    L(@"[acc] light new-device (kept onboarding/settings) uuid=%@", newUUID);
+}
+
 static void do_wipe(void) {
     NSString *SUITE = @"group.com.dena.mirrativ.shared";
     NSString *KEY   = @"deviceUUID";
@@ -486,10 +573,20 @@ static void do_wipe(void) {
         }
     }
 
-    // 4) IDFV を新しい偽値に更新
+    // 4) Cookie を消して完全ログアウト（ソーシャルログインのセッションが残るのを防ぐ）
+    NSString *lib = [NSHomeDirectory() stringByAppendingPathComponent:@"Library"];
+    NSString *ck = [lib stringByAppendingPathComponent:@"Cookies"];
+    for (NSString *f in [fm contentsOfDirectoryAtPath:ck error:nil]) {
+        [fm removeItemAtPath:[ck stringByAppendingPathComponent:f] error:nil];
+        L(@"rm cookie %@", f);
+    }
+    for (NSHTTPCookie *c in [[NSHTTPCookieStorage sharedHTTPCookieStorage].cookies copy])
+        [[NSHTTPCookieStorage sharedHTTPCookieStorage] deleteCookie:c];
+
+    // 5) IDFV を新しい偽値に更新
     regenerate_fake_idfv();
 
-    L(@"wiped -> new device this launch");
+    L(@"wiped -> logged out + new device this launch");
 }
 
 // dylib ロード時（アプリの main より前）に1回だけ実行される
@@ -510,8 +607,14 @@ static void reset_gate(void) {
             return;
         }
 
+        // 軽量リセット（新規アカで自動ログイン・オンボーディング維持）
+        if ([fm fileExistsAtPath:docs_path(@"NEW_LIGHT")]) {
+            [fm removeItemAtPath:docs_path(@"NEW_LIGHT") error:nil];
+            do_new_device_light();
+        }
+
         BOOL bySetting = [[NSUserDefaults standardUserDefaults] boolForKey:@"reset_on_next_launch"];
-        BOOL byFile  = [fm fileExistsAtPath:docs_path(@"RESET_ON")];    // 1回だけ（自動削除）
+        BOOL byFile  = [fm fileExistsAtPath:docs_path(@"RESET_ON")];    // 1回だけ（自動削除, 完全初期化）
         BOOL byEvery = [fm fileExistsAtPath:docs_path(@"RESET_EVERY")]; // 冷起動ごと（永続）
         BOOL armed = (bySetting || byFile || byEvery);
         L(@"gate: setting=%d once=%d every=%d armed=%d", bySetting, byFile, byEvery, armed);
@@ -544,6 +647,9 @@ static void reset_gate(void) {
         [(prev ? [prev stringByAppendingString:line] : line)
             writeToFile:docs_path(@"uuidreset_status.txt")
              atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+        // 新規アカ作成の自動保存が予約されていれば仕込む
+        acc_schedule_autosave();
 
         // アプリ起動後にフローティングUI(BGボタン)を設置
         [[NSNotificationCenter defaultCenter]
