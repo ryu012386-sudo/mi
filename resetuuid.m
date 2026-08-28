@@ -212,14 +212,16 @@ static UIViewController *bg_top_vc(void) {
     });
 }
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results API_AVAILABLE(ios(14.0)) {
-    [picker dismissViewControllerAnimated:YES completion:nil];
-    if (!results.count) return;
     NSItemProvider *ip = results.firstObject.itemProvider;
-    if ([ip canLoadObjectOfClass:UIImage.class]) {
+    [picker dismissViewControllerAnimated:YES completion:^{   // 閉じ切ってから処理
+        if (!ip || ![ip canLoadObjectOfClass:UIImage.class]) {
+            [self alert:@"失敗" msg:@"この画像は読み込めません"]; return;
+        }
         [ip loadObjectOfClass:UIImage.class completionHandler:^(id<NSItemProviderReading> obj, NSError *err){
-            if ([obj isKindOfClass:UIImage.class]) [self saveImage:(UIImage *)obj];
+            UIImage *img = [obj isKindOfClass:UIImage.class] ? (UIImage *)obj : nil;
+            dispatch_async(dispatch_get_main_queue(), ^{ [self saveImage:img]; });  // 必ずメインで
         }];
-    }
+    }];
 }
 - (void)pickFile {
     UIDocumentPickerViewController *dp;
@@ -241,14 +243,14 @@ static UIViewController *bg_top_vc(void) {
     UIImage *img = [UIImage imageWithData:d];
     if (img) [self saveImage:img]; else [self alert:@"失敗" msg:@"画像を読めませんでした"];
 }
-- (void)saveImage:(UIImage *)img {
-    NSData *jpg = bg_real_jpeg(img);   // ← interpose を回避して本物でエンコード
+- (void)saveImage:(UIImage *)img {   // メインスレッド前提
+    if (!img) { [self alert:@"失敗" msg:@"画像を取得できませんでした"]; return; }
+    NSData *jpg = bg_real_jpeg(img);   // interpose を回避して本物でエンコード
+    if (!jpg.length) { [self alert:@"失敗" msg:@"エンコードに失敗しました"]; return; }
     BOOL ok = [jpg writeToFile:docs_path(@"custom_bg.jpg") atomically:YES];
     L(@"[bg] saved custom_bg.jpg ok=%d bytes=%lu", ok, (unsigned long)jpg.length);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self setSwap:YES];   // 保存したら自動でONにする
-        [self alert:@"セット完了" msg:@"画像を保存し『差し替えON』にしました。クローゼットで背景に設定してください。設定後はもう一度BG→OFFにしてください。"];
-    });
+    [self setSwap:YES];   // 保存したら自動でON
+    [self alert:@"セット完了" msg:@"画像を保存し『差し替えON』にしました。クローゼットで背景に設定してください。設定後は BG→OFF に。"];
 }
 @end
 
