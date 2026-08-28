@@ -248,6 +248,46 @@ static void acc_schedule_autosave(void) {
                    dispatch_get_main_queue(), ^{ doSave(); });
 }
 
+// セッション/ユーザー系の prefs キーだけ消す（オンボーディング/設定は残す）
+static void acc_clear_session_prefs(void) {
+    NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+    NSArray *pat = @[@"user", @"session", @"token", @"auth", @"login", @"oauth", @"jwt",
+                     @"credential", @"cookie", @"myself", @"account", @"uid",
+                     @"access", @"refresh", @"currentuser", @"me_", @"_me", @"signin"];
+    for (NSString *f in mirrativ_pref_files()) {
+        NSString *dom = [f stringByDeletingPathExtension];
+        NSDictionary *d = [u persistentDomainForName:dom];
+        if (!d) continue;
+        NSMutableDictionary *m = [d mutableCopy];
+        for (NSString *k in d.allKeys) {
+            NSString *lk = k.lowercaseString;
+            for (NSString *p in pat) if ([lk containsString:p]) { [m removeObjectForKey:k]; break; }
+        }
+        if (m.count != d.count) {
+            [u setPersistentDomain:m forName:dom];
+            L(@"[acc] cleared %lu session keys in %@", (unsigned long)(d.count - m.count), dom);
+        }
+    }
+    [u synchronize];
+}
+// 診断用：mirrativ prefs のキー一覧を Documents/prefs_dump.txt に出力
+static void acc_dump_pref_keys(void) {
+    NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
+    NSMutableString *s = [NSMutableString string];
+    for (NSString *f in mirrativ_pref_files()) {
+        NSString *dom = [f stringByDeletingPathExtension];
+        NSDictionary *d = [u persistentDomainForName:dom];
+        [s appendFormat:@"== %@ (%lu keys) ==\n", dom, (unsigned long)d.count];
+        for (NSString *k in [d.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+            id v = d[k];
+            NSString *vs = [v isKindOfClass:NSString.class] ? v : NSStringFromClass([v class]);
+            if (vs.length > 70) vs = [[vs substringToIndex:70] stringByAppendingString:@"…"];
+            [s appendFormat:@"  %@ = %@\n", k, vs];
+        }
+    }
+    [s writeToFile:docs_path(@"prefs_dump.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
 // ==== アプリ内フローティングUI ====
 @interface MRVPassthroughView : UIView @end
 @implementation MRVPassthroughView
@@ -515,9 +555,11 @@ static void do_new_device_light(void) {
     NSString *SUITE = @"group.com.dena.mirrativ.shared";
     NSString *newUUID = [[NSUUID UUID] UUIDString];
 
-    // Keychain の deviceUUID を差し替え
-    SecItemDelete((__bridge CFDictionaryRef)@{ (__bridge id)kSecClass:(__bridge id)kSecClassGenericPassword,
-                                               (__bridge id)kSecAttrAccount:@"com.dena.mirrativ.uuid" });
+    // 診断：消す前のキー一覧を保存
+    acc_dump_pref_keys();
+
+    // Keychain: セッション/認証を全消し（generic password 全部）→ 新 deviceUUID を追加
+    SecItemDelete((__bridge CFDictionaryRef)@{ (__bridge id)kSecClass:(__bridge id)kSecClassGenericPassword });
     SecItemAdd((__bridge CFDictionaryRef)@{ (__bridge id)kSecClass:(__bridge id)kSecClassGenericPassword,
                                             (__bridge id)kSecAttrAccount:@"com.dena.mirrativ.uuid",
                                             (__bridge id)kSecValueData:[newUUID dataUsingEncoding:NSUTF8StringEncoding] }, NULL);
@@ -526,6 +568,9 @@ static void do_new_device_light(void) {
     NSUserDefaults *grp = [[NSUserDefaults alloc] initWithSuiteName:SUITE];
     [std setObject:newUUID forKey:@"deviceUUID"]; [std synchronize];
     [grp setObject:newUUID forKey:@"deviceUUID"]; [grp synchronize];
+
+    // セッション/ユーザー系の prefs キーだけ消す（オンボーディング/設定は残す）
+    acc_clear_session_prefs();
 
     // Cookie を消して旧セッションを切る
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -536,7 +581,7 @@ static void do_new_device_light(void) {
         [[NSHTTPCookieStorage sharedHTTPCookieStorage] deleteCookie:c];
 
     regenerate_fake_idfv();
-    L(@"[acc] light new-device (kept onboarding/settings) uuid=%@", newUUID);
+    L(@"[acc] light new-device (cleared session, kept onboarding) uuid=%@", newUUID);
 }
 
 static void do_wipe(void) {
