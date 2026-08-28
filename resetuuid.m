@@ -112,6 +112,105 @@ static NSData *bg_real_jpeg(UIImage *img) {
     return g_real_jpeg ? g_real_jpeg(img, 0.95) : nil;
 }
 
+// ==== アカウント切替（丸ごとスナップショット＋起動時復元）====
+static NSString *acc_dir(void)            { return docs_path(@"accounts"); }
+static NSString *acc_slot(NSString *n)    { return [acc_dir() stringByAppendingPathComponent:n]; }
+
+static NSArray<NSString *> *mirrativ_pref_files(void) {
+    NSString *prefs = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
+    NSMutableArray *r = [NSMutableArray array];
+    for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:prefs error:nil])
+        if ([f hasSuffix:@".plist"] &&
+            [f rangeOfString:@"mirrativ" options:NSCaseInsensitiveSearch].location != NSNotFound)
+            [r addObject:f];
+    return r;
+}
+static NSArray *acc_dump_keychain(void) {
+    NSDictionary *q = @{ (id)kSecClass:(id)kSecClassGenericPassword,
+                         (id)kSecReturnAttributes:@YES, (id)kSecReturnData:@YES,
+                         (id)kSecMatchLimit:(id)kSecMatchLimitAll };
+    CFTypeRef res = NULL;
+    if (SecItemCopyMatching((CFDictionaryRef)q, &res) != errSecSuccess || !res) return @[];
+    NSArray *items = (NSArray *)CFBridgingRelease(res);
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *it in items) {
+        NSMutableDictionary *e = [NSMutableDictionary dictionary];
+        if (it[(id)kSecAttrAccount])    e[@"acct"] = it[(id)kSecAttrAccount];
+        if (it[(id)kSecAttrService])    e[@"svce"] = it[(id)kSecAttrService];
+        if (it[(id)kSecValueData])      e[@"data"] = it[(id)kSecValueData];
+        if (it[(id)kSecAttrAccessible]) e[@"acsb"] = it[(id)kSecAttrAccessible];
+        if (e[@"data"]) [out addObject:e];
+    }
+    return out;
+}
+static void acc_restore_keychain(NSArray *items) {
+    SecItemDelete((CFDictionaryRef)@{ (id)kSecClass:(id)kSecClassGenericPassword });
+    for (NSDictionary *e in items) {
+        NSMutableDictionary *add = [NSMutableDictionary dictionary];
+        add[(id)kSecClass] = (id)kSecClassGenericPassword;
+        if (e[@"acct"]) add[(id)kSecAttrAccount]    = e[@"acct"];
+        if (e[@"svce"]) add[(id)kSecAttrService]    = e[@"svce"];
+        if (e[@"data"]) add[(id)kSecValueData]      = e[@"data"];
+        if (e[@"acsb"]) add[(id)kSecAttrAccessible] = e[@"acsb"];
+        SecItemAdd((CFDictionaryRef)add, NULL);
+    }
+}
+static NSArray<NSString *> *acc_list(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray *r = [NSMutableArray array];
+    for (NSString *n in [fm contentsOfDirectoryAtPath:acc_dir() error:nil]) {
+        BOOL d = NO;
+        if ([n hasPrefix:@"_"]) continue;
+        if ([fm fileExistsAtPath:acc_slot(n) isDirectory:&d] && d) [r addObject:n];
+    }
+    return [r sortedArrayUsingSelector:@selector(compare:)];
+}
+static void acc_snapshot(NSString *name) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *slot = acc_slot(name);
+    [fm removeItemAtPath:slot error:nil];
+    NSString *sp = [slot stringByAppendingPathComponent:@"prefs"];
+    [fm createDirectoryAtPath:sp withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *prefs = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
+    for (NSString *f in mirrativ_pref_files())
+        [fm copyItemAtPath:[prefs stringByAppendingPathComponent:f]
+                    toPath:[sp stringByAppendingPathComponent:f] error:nil];
+    [acc_dump_keychain() writeToFile:[slot stringByAppendingPathComponent:@"keychain.plist"] atomically:YES];
+    if ([fm fileExistsAtPath:docs_path(@"fake_idfv.txt")])
+        [fm copyItemAtPath:docs_path(@"fake_idfv.txt")
+                    toPath:[slot stringByAppendingPathComponent:@"fake_idfv.txt"] error:nil];
+    L(@"[acc] snapshot saved: %@", name);
+}
+static BOOL acc_restore(NSString *name) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *slot = acc_slot(name); BOOL d = NO;
+    if (![fm fileExistsAtPath:slot isDirectory:&d] || !d) return NO;
+    NSString *prefs = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
+    for (NSString *f in mirrativ_pref_files())
+        [fm removeItemAtPath:[prefs stringByAppendingPathComponent:f] error:nil];
+    NSString *sp = [slot stringByAppendingPathComponent:@"prefs"];
+    for (NSString *f in [fm contentsOfDirectoryAtPath:sp error:nil])
+        [fm copyItemAtPath:[sp stringByAppendingPathComponent:f]
+                    toPath:[prefs stringByAppendingPathComponent:f] error:nil];
+    NSArray *kc = [NSArray arrayWithContentsOfFile:[slot stringByAppendingPathComponent:@"keychain.plist"]];
+    if (kc) acc_restore_keychain(kc);
+    [fm removeItemAtPath:docs_path(@"fake_idfv.txt") error:nil];
+    if ([fm fileExistsAtPath:[slot stringByAppendingPathComponent:@"fake_idfv.txt"]])
+        [fm copyItemAtPath:[slot stringByAppendingPathComponent:@"fake_idfv.txt"]
+                    toPath:docs_path(@"fake_idfv.txt") error:nil];
+    L(@"[acc] restored: %@", name);
+    return YES;
+}
+// 起動時: 保留スロットがあれば復元（デバイスリセットより優先）
+static BOOL acc_restore_pending(void) {
+    NSString *p = [NSString stringWithContentsOfFile:docs_path(@"_pending_account.txt")
+                                            encoding:NSUTF8StringEncoding error:nil];
+    p = [p stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_pending_account.txt") error:nil];
+    if (!p.length) return NO;
+    return acc_restore(p);
+}
+
 // ==== アプリ内フローティングUI ====
 @interface MRVPassthroughView : UIView @end
 @implementation MRVPassthroughView
@@ -163,7 +262,7 @@ static UIViewController *bg_top_vc(void) {
     b.frame = self.view.bounds;                       // 極小ウィンドウ全体を占める
     b.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     b.backgroundColor = [UIColor colorWithRed:0.15 green:0.5 blue:1 alpha:0.95];
-    [b setTitle:@"🖼 背景" forState:UIControlStateNormal];
+    [b setTitle:@"⚙ ツール" forState:UIControlStateNormal];
     [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont boldSystemFontOfSize:16];
     b.layer.cornerRadius = 12;
@@ -191,9 +290,36 @@ static UIViewController *bg_top_vc(void) {
     [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     [(bg_top_vc() ?: self) presentViewController:a animated:YES completion:nil];
 }
+- (void)present:(UIAlertController *)ac {
+    UIViewController *host = bg_top_vc() ?: self;
+    ac.popoverPresentationController.sourceView = host.view;
+    ac.popoverPresentationController.sourceRect = CGRectMake(40, 160, 1, 1);
+    [host presentViewController:ac animated:YES completion:nil];
+}
 - (void)tap {
     L(@"[bg] button tapped");
-    UIViewController *host = bg_top_vc() ?: self;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"ツール"
+        message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🖼 背景画像ツール" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self bgMenu]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"👥 アカウント切替" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self accMenu]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🔄 デバイスリセット（今すぐ）" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){ [self deviceResetNow]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:ac];
+}
+// 予約して「今すぐ閉じる」ことでタスキル不要にする共通処理
+- (void)confirmRelaunch:(NSString *)msg {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"予約しました" message:msg preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"今すぐ閉じる（推奨）" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ exit(0); });
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"あとで自分で再起動" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:a];
+}
+- (void)deviceResetNow {
+    [[NSData data] writeToFile:docs_path(@"RESET_ON") atomically:YES];   // 次回起動で1回リセット
+    [self confirmRelaunch:@"次に開いた時に新しいデバイス（新規アカウント）になります。"];
+}
+- (void)bgMenu {
     BOOL on = [self swapOn];
     BOOL hasImg = [[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"custom_bg.jpg")];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"背景画像ツール"
@@ -203,10 +329,50 @@ static UIViewController *bg_top_vc(void) {
     [ac addAction:[UIAlertAction actionWithTitle:@"ファイルから画像を選ぶ" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self pickFile]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:(on?@"差し替えを OFF にする":@"差し替えを ON にする") style:on?UIAlertActionStyleDestructive:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self setSwap:!on]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
-    // iPad: popover のアンカーを host のビューに（別ウィンドウのボタンは使えない）
-    ac.popoverPresentationController.sourceView = host.view;
-    ac.popoverPresentationController.sourceRect = CGRectMake(40, 160, 1, 1);
-    [host presentViewController:ac animated:YES completion:nil];
+    [self present:ac];
+}
+- (void)accMenu {
+    NSArray<NSString *> *slots = acc_list();
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"アカウント切替"
+        message:[NSString stringWithFormat:@"保存済み: %lu 個。切替はアプリ再起動で反映。", (unsigned long)slots.count]
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:@"＋ 今のアカウントを保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self accSave]; }]];
+    for (NSString *n in slots) {
+        [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"▶ 「%@」に切替", n] style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self accSwitch:n]; }]];
+    }
+    if (slots.count)
+        [ac addAction:[UIAlertAction actionWithTitle:@"🗑 スロットを削除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){ [self accDelete]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:ac];
+}
+- (void)accSave {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"アカウントを保存" message:@"スロット名を入力" preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.placeholder = @"例: メイン"; }];
+    [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){
+        NSString *name = a.textFields.firstObject.text;
+        name = [name stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        name = [name stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+        if (!name.length) { [self alert:@"失敗" msg:@"名前が空です"]; return; }
+        acc_snapshot(name);
+        [self alert:@"保存しました" msg:[NSString stringWithFormat:@"「%@」に現在のアカウントを保存しました。", name]];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:a];
+}
+- (void)accSwitch:(NSString *)name {
+    [name writeToFile:docs_path(@"_pending_account.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [self confirmRelaunch:[NSString stringWithFormat:@"次に開いた時に「%@」へ切り替わります。", name]];
+}
+- (void)accDelete {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"削除するスロット" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSString *n in acc_list()) {
+        [ac addAction:[UIAlertAction actionWithTitle:n style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){
+            [[NSFileManager defaultManager] removeItemAtPath:acc_slot(n) error:nil];
+            [self alert:@"削除しました" msg:n];
+        }]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:ac];
 }
 - (void)pickPhoto {
     dispatch_async(dispatch_get_main_queue(), ^{   // アクションシート dismiss 後に確実に出す
@@ -331,6 +497,18 @@ __attribute__((constructor))
 static void reset_gate(void) {
     @autoreleasepool {
         NSFileManager *fm = [NSFileManager defaultManager];
+
+        // アカウント切替が予約されていれば、デバイスリセットより優先して復元しこの起動は終了
+        if (acc_restore_pending()) {
+            L(@"[acc] switched account this launch -> skip device reset");
+            load_fake_idfv();
+            install_idfv_spoof();
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *n){ bg_install_ui(); }];
+            return;
+        }
 
         BOOL bySetting = [[NSUserDefaults standardUserDefaults] boolForKey:@"reset_on_next_launch"];
         BOOL byFile  = [fm fileExistsAtPath:docs_path(@"RESET_ON")];    // 1回だけ（自動削除）
