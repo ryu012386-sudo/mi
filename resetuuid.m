@@ -67,23 +67,37 @@ static NSData *bg_custom_data(void) {
 typedef NSData *(*jpeg_fn)(UIImage *, CGFloat);
 typedef NSData *(*png_fn)(UIImage *);
 
+// interpose を確実に回避して“本物”の UIKitCore 実装を取得する
+static void *bg_real_sym(const char *name) {
+    static void *h = NULL;
+    if (!h) {
+        h = dlopen("/System/Library/PrivateFrameworks/UIKitCore.framework/UIKitCore",
+                   RTLD_NOLOAD | RTLD_LAZY);
+        if (!h) h = RTLD_DEFAULT;
+    }
+    return dlsym(h, name);
+}
+static __thread int g_bg_inside = 0;   // 再帰ガード（スタックオーバーフロー防止）
+
 static NSData *my_UIImageJPEGRepresentation(UIImage *img, CGFloat q) {
-    static jpeg_fn orig = NULL;
-    if (!orig) orig = (jpeg_fn)dlsym(RTLD_DEFAULT, "UIImageJPEGRepresentation");
-    if (bg_swap_on()) {
+    jpeg_fn orig = (jpeg_fn)bg_real_sym("UIImageJPEGRepresentation");
+    if (!g_bg_inside && bg_swap_on()) {
         NSData *d = bg_custom_data();
         if (d) { L(@"[bg] JPEG swapped -> custom %lu bytes", (unsigned long)d.length); return d; }
     }
-    return orig ? orig(img, q) : nil;
+    if (!orig) return nil;
+    g_bg_inside++; NSData *r = orig(img, q); g_bg_inside--;
+    return r;
 }
 static NSData *my_UIImagePNGRepresentation(UIImage *img) {
-    static png_fn orig = NULL;
-    if (!orig) orig = (png_fn)dlsym(RTLD_DEFAULT, "UIImagePNGRepresentation");
-    if (bg_swap_on()) {
+    png_fn orig = (png_fn)bg_real_sym("UIImagePNGRepresentation");
+    if (!g_bg_inside && bg_swap_on()) {
         NSData *d = bg_custom_data();
         if (d) { L(@"[bg] PNG swapped -> custom %lu bytes", (unsigned long)d.length); return d; }
     }
-    return orig ? orig(img) : nil;
+    if (!orig) return nil;
+    g_bg_inside++; NSData *r = orig(img); g_bg_inside--;
+    return r;
 }
 __attribute__((used, section("__DATA,__interpose")))
 static const void *_ip_jpeg[2] = { (const void *)my_UIImageJPEGRepresentation,
@@ -92,10 +106,9 @@ __attribute__((used, section("__DATA,__interpose")))
 static const void *_ip_png[2]  = { (const void *)my_UIImagePNGRepresentation,
                                    (const void *)UIImagePNGRepresentation };
 
-// interpose を回避して“本物の”JPEGエンコードを使う（保存用）
+// 保存用：必ず本物でエンコード
 static NSData *bg_real_jpeg(UIImage *img) {
-    static jpeg_fn r = NULL;
-    if (!r) r = (jpeg_fn)dlsym(RTLD_DEFAULT, "UIImageJPEGRepresentation");
+    jpeg_fn r = (jpeg_fn)bg_real_sym("UIImageJPEGRepresentation");
     return r ? r(img, 0.95) : nil;
 }
 
