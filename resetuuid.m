@@ -81,6 +81,7 @@ static __thread int g_bg_inside = 0;   // 再帰ガード（スタックオー�
 
 static NSData *my_UIImageJPEGRepresentation(UIImage *img, CGFloat q) {
     jpeg_fn orig = (jpeg_fn)bg_real_sym("UIImageJPEGRepresentation");
+    if (orig == (jpeg_fn)&my_UIImageJPEGRepresentation) orig = NULL;   // 自己参照→再帰遮断
     if (!g_bg_inside && bg_swap_on()) {
         NSData *d = bg_custom_data();
         if (d) { L(@"[bg] JPEG swapped -> custom %lu bytes", (unsigned long)d.length); return d; }
@@ -91,6 +92,7 @@ static NSData *my_UIImageJPEGRepresentation(UIImage *img, CGFloat q) {
 }
 static NSData *my_UIImagePNGRepresentation(UIImage *img) {
     png_fn orig = (png_fn)bg_real_sym("UIImagePNGRepresentation");
+    if (orig == (png_fn)&my_UIImagePNGRepresentation) orig = NULL;     // 自己参照→再帰遮断
     if (!g_bg_inside && bg_swap_on()) {
         NSData *d = bg_custom_data();
         if (d) { L(@"[bg] PNG swapped -> custom %lu bytes", (unsigned long)d.length); return d; }
