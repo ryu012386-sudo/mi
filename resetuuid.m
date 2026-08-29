@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <dlfcn.h>
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -288,6 +289,35 @@ static void acc_dump_pref_keys(void) {
     [s writeToFile:docs_path(@"prefs_dump.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
+// ==== 新規アカ自動作成：オンボーディングの「はじめる」を自動タップ ====
+static void (*g_orig_onbo_vda)(id, SEL, BOOL) = NULL;
+static void my_onbo_viewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (g_orig_onbo_vda) g_orig_onbo_vda(self, _cmd, animated);
+    if (![[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"AUTO_CREATE")]) return;
+    [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"AUTO_CREATE") error:nil];  // 一度だけ
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try {
+            SEL sel = NSSelectorFromString(@"createAccountButton");
+            if (![self respondsToSelector:sel]) { L(@"[acc] no createAccountButton"); return; }
+            UIButton *b = ((UIButton *(*)(id, SEL))objc_msgSend)(self, sel);
+            [b sendActionsForControlEvents:UIControlEventTouchUpInside];
+            L(@"[acc] auto-tapped createAccount (button=%@)", b);
+        } @catch (NSException *e) { L(@"[acc] auto-tap failed: %@", e); }
+    });
+}
+static void install_onbo_autocreate(void) {
+    static BOOL done = NO; if (done) return;
+    Class c = objc_getClass("_TtC8mirrativ39OnboardingRegisterOrLoginViewController");
+    if (!c) return;   // まだクラス未登録。次の active で再試行
+    done = YES;
+    Method m = class_getInstanceMethod(c, @selector(viewDidAppear:));
+    if (!m) { L(@"[acc] onbo viewDidAppear not found"); return; }
+    g_orig_onbo_vda = (void (*)(id, SEL, BOOL))method_getImplementation(m);
+    method_setImplementation(m, (IMP)my_onbo_viewDidAppear);
+    L(@"[acc] onbo auto-create hook installed");
+}
+
 // ==== アプリ内フローティングUI ====
 @interface MRVPassthroughView : UIView @end
 @implementation MRVPassthroughView
@@ -395,8 +425,9 @@ static UIViewController *bg_top_vc(void) {
     [self present:a];
 }
 - (void)lightNewNow {
-    [[NSData data] writeToFile:docs_path(@"NEW_LIGHT") atomically:YES];   // 軽量：新UUIDのみ、設定は維持
-    [self confirmRelaunch:@"開き直すと、新しい匿名アカウントで自動ログイン状態になります（手動作成なし）。"];
+    [[NSData data] writeToFile:docs_path(@"NEW_LIGHT") atomically:YES];    // 新UUID＋セッション消去
+    [[NSData data] writeToFile:docs_path(@"AUTO_CREATE") atomically:YES];  // 「はじめる」を自動タップ
+    [self confirmRelaunch:@"開き直すと、新しい匿名アカウントが自動で作成・ログインされます。"];
 }
 - (void)deviceResetNow {
     [[NSData data] writeToFile:docs_path(@"RESET_ON") atomically:YES];   // 完全初期化（prefs全消し＝オンボーディングから）
@@ -409,9 +440,10 @@ static UIViewController *bg_top_vc(void) {
         NSString *name = [a.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         name = [name stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
         if (!name.length) { [self alert:@"失敗" msg:@"名前が空です"]; return; }
-        [[NSData data] writeToFile:docs_path(@"NEW_LIGHT") atomically:YES];           // 軽量：新規アカで自動ログイン
+        [[NSData data] writeToFile:docs_path(@"NEW_LIGHT") atomically:YES];           // 新UUID＋セッション消去
+        [[NSData data] writeToFile:docs_path(@"AUTO_CREATE") atomically:YES];         // 「はじめる」自動タップ
         [name writeToFile:docs_path(@"_autosave_name.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil]; // 起動後に自動保存
-        [self confirmRelaunch:[NSString stringWithFormat:@"開き直すと新規アカで自動ログインし、少し使うと自動で「%@」に保存します。", name]];
+        [self confirmRelaunch:[NSString stringWithFormat:@"開き直すと新規アカを自動作成し、少し使うと自動で「%@」に保存します。", name]];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
     [self present:a];
@@ -640,6 +672,9 @@ static void reset_gate(void) {
     @autoreleasepool {
         NSFileManager *fm = [NSFileManager defaultManager];
 
+        // オンボーディング自動タップのフックを早期に仕込む（間に合わなければ active で再試行）
+        install_onbo_autocreate();
+
         // アカウント切替が予約されていれば、デバイスリセットより優先して復元しこの起動は終了
         if (acc_restore_pending()) {
             L(@"[acc] switched account this launch -> skip device reset");
@@ -648,7 +683,7 @@ static void reset_gate(void) {
             [[NSNotificationCenter defaultCenter]
                 addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
                              queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *n){ bg_install_ui(); }];
+                        usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); }];
             return;
         }
 
@@ -701,6 +736,6 @@ static void reset_gate(void) {
             addObserverForName:UIApplicationDidBecomeActiveNotification
                         object:nil
                          queue:[NSOperationQueue mainQueue]
-                    usingBlock:^(NSNotification *n){ bg_install_ui(); }];
+                    usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); }];
     }
 }
