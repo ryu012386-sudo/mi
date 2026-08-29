@@ -318,6 +318,51 @@ static void install_onbo_autocreate(void) {
     L(@"[acc] onbo auto-create hook installed");
 }
 
+// ==== 名前などプロフィール編集の文字数上限を最低100文字に引き上げ ====
+// ProfileEdit* クラスの入力制限デリゲートを差し替え、元がNGでも100文字までは許可（縮めはしない）
+static struct { Class c; SEL s; IMP orig; } g_len_reg[128];
+static int g_len_n = 0;
+static IMP name_find_orig(id self, SEL _cmd) {
+    for (Class k = object_getClass(self); k; k = class_getSuperclass(k))
+        for (int i = 0; i < g_len_n; i++)
+            if (g_len_reg[i].c == k && g_len_reg[i].s == _cmd) return g_len_reg[i].orig;
+    return NULL;
+}
+static BOOL name_should(id self, SEL _cmd, id view, NSRange r, NSString *rep) {
+    IMP o = name_find_orig(self, _cmd);
+    BOOL ok = o ? ((BOOL (*)(id, SEL, id, NSRange, NSString *))o)(self, _cmd, view, r, rep) : YES;
+    if (ok) return YES;                 // 元が許可ならそのまま（bio等の長い制限を縮めない）
+    NSString *cur = @"";
+    @try { cur = [view text] ?: @""; } @catch (__unused NSException *e) {}
+    if (r.location > cur.length) return NO;
+    NSInteger newLen = (NSInteger)cur.length - (NSInteger)r.length + (NSInteger)rep.length;
+    return newLen <= 100;               // 元がNGでも100文字までは許可
+}
+static void install_name_limit_hook(void) {
+    static BOOL done = NO; if (done) return;
+    unsigned int n = 0; Class *cls = objc_copyClassList(&n); if (!cls) return;
+    SEL selTF = @selector(textField:shouldChangeCharactersInRange:replacementString:);
+    SEL selTV = @selector(textView:shouldChangeTextInRange:replacementText:);
+    int hooked = 0;
+    for (unsigned int i = 0; i < n; i++) {
+        Class c = cls[i]; const char *nm = class_getName(c);
+        if (!nm || !strstr(nm, "ProfileEdit")) continue;
+        unsigned int mc = 0; Method *ms = class_copyMethodList(c, &mc);
+        for (unsigned int j = 0; j < mc; j++) {
+            SEL s = method_getName(ms[j]);
+            if ((s == selTF || s == selTV) && g_len_n < 128) {
+                g_len_reg[g_len_n].c = c; g_len_reg[g_len_n].s = s;
+                g_len_reg[g_len_n].orig = method_getImplementation(ms[j]); g_len_n++;
+                method_setImplementation(ms[j], (IMP)name_should);
+                hooked++;
+            }
+        }
+        if (ms) free(ms);
+    }
+    free(cls); done = YES;
+    L(@"[namelimit] hooked %d ProfileEdit delegate methods (cap->100)", hooked);
+}
+
 // ==== アプリ内フローティングUI ====
 @interface MRVPassthroughView : UIView @end
 @implementation MRVPassthroughView
@@ -683,7 +728,7 @@ static void reset_gate(void) {
             [[NSNotificationCenter defaultCenter]
                 addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
                              queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); }];
+                        usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); install_name_limit_hook(); }];
             return;
         }
 
@@ -736,6 +781,6 @@ static void reset_gate(void) {
             addObserverForName:UIApplicationDidBecomeActiveNotification
                         object:nil
                          queue:[NSOperationQueue mainQueue]
-                    usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); }];
+                    usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); install_name_limit_hook(); }];
     }
 }
