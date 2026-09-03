@@ -6,6 +6,7 @@
 #import <dlfcn.h>
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#include <sys/sysctl.h>
 
 static void L(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -711,6 +712,57 @@ static void do_wipe(void) {
     L(@"wiped -> logged out + new device this launch");
 }
 
+// ==== device_id / User-Agent 抽出（Pythonクライアント用） ====
+// アプリが実際に送る device_id を全ソースから読み、Documents/device_id.txt に吐く。
+// httpHeaders の device_id は DeviceIDUtil.getUUID()（App-Group cache → Keychain の順）。
+static NSString *read_keychain_uuid(void) {
+    NSDictionary *q = @{ (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
+                         (__bridge id)kSecAttrAccount:  @"com.dena.mirrativ.uuid",
+                         (__bridge id)kSecReturnData:   @YES,
+                         (__bridge id)kSecMatchLimit:   (__bridge id)kSecMatchLimitOne };
+    CFTypeRef res = NULL;
+    if (SecItemCopyMatching((__bridge CFDictionaryRef)q, &res) == errSecSuccess && res) {
+        NSData *d = (NSData *)CFBridgingRelease(res);
+        return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    }
+    return nil;
+}
+static NSString *device_model(void) {
+    char buf[64] = {0}; size_t len = sizeof(buf);
+    if (sysctlbyname("hw.machine", buf, &len, NULL, 0) == 0 && buf[0])
+        return [NSString stringWithUTF8String:buf];
+    return @"iPhone";
+}
+static void dump_device_id(void) {
+    NSString *SUITE = @"group.com.dena.mirrativ.shared";
+    NSString *kc  = read_keychain_uuid();
+    NSString *std = [[NSUserDefaults standardUserDefaults] stringForKey:@"deviceUUID"];
+    NSString *grp = [[[NSUserDefaults alloc] initWithSuiteName:SUITE] stringForKey:@"deviceUUID"];
+    NSString *eff = grp ?: (kc ?: std);   // 実効 device_id（getUUID の優先順）
+    NSString *idfv = g_fakeIDFV ?: [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+    NSString *ver  = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+    NSString *os   = [[UIDevice currentDevice] systemVersion];
+    NSString *model = device_model();
+    NSString *ua = [NSString stringWithFormat:@"MR_APP/%@/iOS/%@/%@", ver ?: @"?", model, os ?: @"?"];
+
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"# Mirrativ device_id dump  %@\n", [NSDate date]];
+    [s appendFormat:@"DEVICE_ID (effective) = %@\n", eff ?: @"(nil)"];
+    [s appendFormat:@"  keychain(com.dena.mirrativ.uuid) = %@\n", kc  ?: @"(nil)"];
+    [s appendFormat:@"  std.deviceUUID                   = %@\n", std ?: @"(nil)"];
+    [s appendFormat:@"  group.deviceUUID                 = %@\n", grp ?: @"(nil)"];
+    [s appendFormat:@"IDFV (x-idfv)         = %@\n", idfv ?: @"(nil)"];
+    [s appendFormat:@"USER_AGENT            = %@\n", ua];
+    [s appendString:@"\n--- mirrativ_login.py に貼る ---\n"];
+    [s appendFormat:@"DEVICE_ID   = \"%@\"\n", eff ?: @""];
+    [s appendFormat:@"IDFV        = \"%@\"\n", idfv ?: @""];
+    [s appendFormat:@"APP_VERSION = \"%@\"\n", ver ?: @""];
+    [s appendFormat:@"MODEL       = \"%@\"\n", model];
+    [s appendFormat:@"OS_VERSION  = \"%@\"\n", os ?: @""];
+    [s writeToFile:docs_path(@"device_id.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    L(@"[dump] device_id=%@ ua=%@ -> Documents/device_id.txt", eff, ua);
+}
+
 // dylib ロード時（アプリの main より前）に1回だけ実行される
 __attribute__((constructor))
 static void reset_gate(void) {
@@ -725,6 +777,7 @@ static void reset_gate(void) {
             L(@"[acc] switched account this launch -> skip device reset");
             load_fake_idfv();
             install_idfv_spoof();
+            dump_device_id();   // 復元したアカウントの device_id も吐く
             [[NSNotificationCenter defaultCenter]
                 addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
                              queue:[NSOperationQueue mainQueue]
@@ -762,6 +815,9 @@ static void reset_gate(void) {
 
         // 偽IDFVが設定済みなら（リセット後 or 過去にリセット済み）スプーフを有効化
         install_idfv_spoof();
+
+        // 実効 device_id / User-Agent を Documents/device_id.txt に吐く（Pythonクライアント用）
+        dump_device_id();
 
         // 状態を Documents に追記（ログ不要の確認用）
         NSString *line = [NSString stringWithFormat:@"%@  armed=%d fakeIDFV=%@ bundleID=%@\n",
