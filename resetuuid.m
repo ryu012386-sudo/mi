@@ -763,6 +763,33 @@ static void dump_device_id(void) {
     L(@"[dump] device_id=%@ ua=%@ -> Documents/device_id.txt", eff, ua);
 }
 
+// ==== 認証 cookie(mr_id 等) を Documents/cookies.txt に吐く（本アカ固定用） ====
+// AuthCookieStorage は NSHTTPCookieStorage に保存。mr_id が本アカのセッション identity。
+static void dump_cookies(void) {
+    NSHTTPCookieStorage *cs = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+    NSMutableString *s   = [NSMutableString string];
+    NSMutableString *hdr = [NSMutableString string];   // Cookie: ヘッダ形式
+    NSMutableString *py  = [NSMutableString string];   // python dict
+    [s appendFormat:@"# Mirrativ cookies  %@\n", [NSDate date]];
+    int n = 0;
+    for (NSHTTPCookie *c in cs.cookies) {
+        NSString *dom = c.domain ?: @"";
+        if ([dom rangeOfString:@"mirrativ" options:NSCaseInsensitiveSearch].location == NSNotFound)
+            continue;   // mirrativ ドメインのみ
+        n++;
+        [s appendFormat:@"%@=%@   (domain=%@ path=%@ secure=%d expires=%@)\n",
+            c.name, c.value, dom, c.path, c.isSecure, c.expiresDate ?: @"(session)"];
+        if (hdr.length) [hdr appendString:@"; "];
+        [hdr appendFormat:@"%@=%@", c.name, c.value];
+        [py appendFormat:@"    \"%@\": \"%@\",\n", c.name, c.value];
+    }
+    [s appendFormat:@"\n--- Cookie ヘッダ形式 ---\n%@\n", hdr];
+    [s appendFormat:@"\n--- python (mirrativ_login.py の COOKIES に貼る) ---\nCOOKIES = {\n%@}\n", py];
+    [s appendFormat:@"\n(mirrativ cookies: %d 件)\n", n];
+    [s writeToFile:docs_path(@"cookies.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    L(@"[dump] cookies -> Documents/cookies.txt (%d mirrativ cookies)", n);
+}
+
 // dylib ロード時（アプリの main より前）に1回だけ実行される
 __attribute__((constructor))
 static void reset_gate(void) {
@@ -781,7 +808,7 @@ static void reset_gate(void) {
             [[NSNotificationCenter defaultCenter]
                 addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
                              queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); install_name_limit_hook(); }];
+                        usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); install_name_limit_hook(); dump_cookies(); }];
             return;
         }
 
@@ -818,6 +845,8 @@ static void reset_gate(void) {
 
         // 実効 device_id / User-Agent を Documents/device_id.txt に吐く（Pythonクライアント用）
         dump_device_id();
+        // 永続化済み cookie(mr_id 等) を吐く（前回セッションの本アカ cookie を回収）
+        dump_cookies();
 
         // 状態を Documents に追記（ログ不要の確認用）
         NSString *line = [NSString stringWithFormat:@"%@  armed=%d fakeIDFV=%@ bundleID=%@\n",
@@ -837,6 +866,6 @@ static void reset_gate(void) {
             addObserverForName:UIApplicationDidBecomeActiveNotification
                         object:nil
                          queue:[NSOperationQueue mainQueue]
-                    usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); install_name_limit_hook(); }];
+                    usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); install_name_limit_hook(); dump_cookies(); }];
     }
 }
