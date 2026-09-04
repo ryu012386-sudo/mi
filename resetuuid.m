@@ -462,6 +462,7 @@ static UIViewController *bg_top_vc(void) {
     [ac addAction:[UIAlertAction actionWithTitle:@"👥 アカウント切替" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self accMenu]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🔄 新規アカにする（自動ログイン）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self lightNewNow]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🆕 新規アカ作成（名前つき保存）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self newAccountNamed]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🌐 通信ログ（gift/send捕捉）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self netLogMenu]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🧹 完全初期化（トラブル時）" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){ [self deviceResetNow]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
@@ -508,6 +509,26 @@ static UIViewController *bg_top_vc(void) {
     [ac addAction:[UIAlertAction actionWithTitle:@"アルバムから画像を選ぶ" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self pickPhoto]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"ファイルから画像を選ぶ" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self pickFile]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:(on?@"差し替えを OFF にする":@"差し替えを ON にする") style:on?UIAlertActionStyleDestructive:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self setSwap:!on]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:ac];
+}
+- (void)netLogMenu {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL on = [fm fileExistsAtPath:docs_path(@"NET_LOG")];
+    unsigned long long sz = [[fm attributesOfItemAtPath:docs_path(@"net_dump.txt") error:nil] fileSize];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"通信ログ"
+        message:[NSString stringWithFormat:@"捕捉: %@ / net_dump.txt: %llu bytes\n\nONにして『%@』にギフトを1回送る→OFF→net_dump.txt を回収。gift/send の URL・ヘッダ（署名）・ボディが記録されます。",
+                 on ? @"ON" : @"OFF", sz, @"配信"]
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:(on ? @"捕捉を OFF にする" : @"捕捉を ON にする")
+        style:(on ? UIAlertActionStyleDefault : UIAlertActionStyleDefault) handler:^(UIAlertAction *x) {
+        if (on) [fm removeItemAtPath:docs_path(@"NET_LOG") error:nil];
+        else    [[NSData data] writeToFile:docs_path(@"NET_LOG") atomically:YES];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"net_dump.txt を消去" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+        [fm removeItemAtPath:docs_path(@"net_dump.txt") error:nil];
+        [self alert:@"消去しました" msg:@"net_dump.txt を削除しました。"];
+    }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
 }
@@ -913,6 +934,90 @@ static void dump_gui_config(void) {
       mr_id ? @"present" : @"none");
 }
 
+// ==== 通信ロガー：アプリ実物の gift/send 等リクエストを丸ごと吐く ====
+// Documents/NET_LOG がある時だけ、mirrativ 宛の POST（と /gift 系）を
+// URL・全ヘッダ（署名含む）・ボディ付きで Documents/net_dump.txt に追記する。
+// これで gift/send の“本物”のパラメータ・署名ヘッダが分かり、Python から再現できる。
+static BOOL net_log_on(void) {
+    return [[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"NET_LOG")];
+}
+static void net_dump_request(NSURLRequest *req, NSData *bodyOverride) {
+    @try {
+        if (!net_log_on()) return;
+        NSString *url = req.URL.absoluteString ?: @"";
+        if ([url rangeOfString:@"mirrativ" options:NSCaseInsensitiveSearch].location == NSNotFound) return;
+        NSString *method = req.HTTPMethod ?: @"GET";
+        BOOL isPost = [method caseInsensitiveCompare:@"POST"] == NSOrderedSame;
+        BOOL isGift = [url rangeOfString:@"gift" options:NSCaseInsensitiveSearch].location != NSNotFound;
+        if (!isPost && !isGift) return;   // 書き込み(POST)と gift 系だけに絞る
+
+        NSString *path = docs_path(@"net_dump.txt");
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+        if (attr && [attr fileSize] > 512 * 1024) [fm removeItemAtPath:path error:nil];  // 肥大化防止
+
+        NSMutableString *s = [NSMutableString string];
+        [s appendFormat:@"\n===== %@  %@ =====\n", [NSDate date], method];
+        [s appendFormat:@"URL: %@\n", url];
+        [s appendString:@"-- headers --\n"];
+        [req.allHTTPHeaderFields enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+            [s appendFormat:@"%@: %@\n", k, v];
+        }];
+        NSData *body = bodyOverride ?: req.HTTPBody;
+        [s appendString:@"-- body --\n"];
+        if (body.length) {
+            NSString *bs = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+            if (bs) [s appendFormat:@"%@\n", bs];
+            else    [s appendFormat:@"(binary %lu bytes) base64=%@\n",
+                     (unsigned long)body.length, [body base64EncodedStringWithOptions:0]];
+        } else if (req.HTTPBodyStream) {
+            [s appendString:@"(body via HTTPBodyStream, not captured)\n"];
+        } else {
+            [s appendString:@"(no body)\n"];
+        }
+        NSString *prev = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+        [(prev ? [prev stringByAppendingString:s] : s)
+            writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        L(@"[net] dumped %@ %@", method, url);
+    } @catch (__unused NSException *e) {}
+}
+
+// NSURLSession の各送信メソッドを差し替え（元を呼ぶ前に丸ごとダンプ）
+static id (*o_dtr_ch)(id, SEL, NSURLRequest *, id) = NULL;
+static id s_dtr_ch(id self, SEL _cmd, NSURLRequest *req, id h) {
+    net_dump_request(req, nil); return o_dtr_ch(self, _cmd, req, h);
+}
+static id (*o_dtr)(id, SEL, NSURLRequest *) = NULL;
+static id s_dtr(id self, SEL _cmd, NSURLRequest *req) {
+    net_dump_request(req, nil); return o_dtr(self, _cmd, req);
+}
+static id (*o_utr_d_ch)(id, SEL, NSURLRequest *, NSData *, id) = NULL;
+static id s_utr_d_ch(id self, SEL _cmd, NSURLRequest *req, NSData *d, id h) {
+    net_dump_request(req, d); return o_utr_d_ch(self, _cmd, req, d, h);
+}
+static id (*o_utr_d)(id, SEL, NSURLRequest *, NSData *) = NULL;
+static id s_utr_d(id self, SEL _cmd, NSURLRequest *req, NSData *d) {
+    net_dump_request(req, d); return o_utr_d(self, _cmd, req, d);
+}
+static void net_hook(Class c, SEL sel, IMP newImp, void *origStore) {
+    if (!c) return;
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) return;
+    if (*(IMP *)origStore) return;   // 二重フック防止
+    *(IMP *)origStore = method_getImplementation(m);
+    method_setImplementation(m, newImp);
+}
+static void install_net_logger(void) {
+    static BOOL done = NO; if (done) return; done = YES;
+    Class c = objc_getClass("NSURLSession");
+    if (!c) { L(@"[net] NSURLSession not found"); return; }
+    net_hook(c, @selector(dataTaskWithRequest:completionHandler:), (IMP)s_dtr_ch, &o_dtr_ch);
+    net_hook(c, @selector(dataTaskWithRequest:),                   (IMP)s_dtr,    &o_dtr);
+    net_hook(c, @selector(uploadTaskWithRequest:fromData:completionHandler:), (IMP)s_utr_d_ch, &o_utr_d_ch);
+    net_hook(c, @selector(uploadTaskWithRequest:fromData:),        (IMP)s_utr_d,  &o_utr_d);
+    L(@"[net] URLSession logger installed (gate: Documents/NET_LOG) -> Documents/net_dump.txt");
+}
+
 // dylib ロード時（アプリの main より前）に1回だけ実行される
 __attribute__((constructor))
 static void reset_gate(void) {
@@ -921,6 +1026,9 @@ static void reset_gate(void) {
 
         // オンボーディング自動タップのフックを早期に仕込む（間に合わなければ active で再試行）
         install_onbo_autocreate();
+
+        // 通信ロガーを仕込む（実際に動くのは Documents/NET_LOG がある時だけ）
+        install_net_logger();
 
         // アカウント切替が予約されていれば、デバイスリセットより優先して復元しこの起動は終了
         if (acc_restore_pending()) {
