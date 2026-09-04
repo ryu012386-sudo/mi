@@ -118,6 +118,9 @@ static NSData *bg_real_jpeg(UIImage *img) {
 static NSString *acc_dir(void)            { return docs_path(@"accounts"); }
 static NSString *acc_slot(NSString *n)    { return [acc_dir() stringByAppendingPathComponent:n]; }
 
+// 複垢用ラベル管理（実体は下部の dump セクションで定義）
+static void acc_set_current_label(NSString *name);
+
 static NSArray<NSString *> *mirrativ_pref_files(void) {
     NSString *prefs = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
     NSMutableArray *r = [NSMutableArray array];
@@ -216,6 +219,7 @@ static BOOL acc_restore(NSString *name) {
     if ([fm fileExistsAtPath:[slot stringByAppendingPathComponent:@"fake_idfv.txt"]])
         [fm copyItemAtPath:[slot stringByAppendingPathComponent:@"fake_idfv.txt"]
                     toPath:docs_path(@"fake_idfv.txt") error:nil];
+    acc_set_current_label(name);   // 複垢：今アクティブなラベルを記録（GUI抽出のラベル用）
     L(@"[acc] restored (cfprefsd): %@", name);
     return YES;
 }
@@ -238,6 +242,7 @@ static void acc_schedule_autosave(void) {
     void (^doSave)(void) = ^{
         static BOOL done = NO; if (done) return; done = YES;
         acc_snapshot(name);
+        acc_set_current_label(name);   // 複垢：保存した新垢を今アクティブなラベルにする
         [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_autosave_name.txt") error:nil];
         L(@"[acc] auto-saved new account as: %@", name);
     };
@@ -529,6 +534,7 @@ static UIViewController *bg_top_vc(void) {
         name = [name stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
         if (!name.length) { [self alert:@"失敗" msg:@"名前が空です"]; return; }
         acc_snapshot(name);
+        acc_set_current_label(name);   // 複垢：以後この垢を「name」として GUI に記録
         [self alert:@"保存しました" msg:[NSString stringWithFormat:@"「%@」に現在のアカウントを保存しました。", name]];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
@@ -659,6 +665,7 @@ static void do_new_device_light(void) {
         [[NSHTTPCookieStorage sharedHTTPCookieStorage] deleteCookie:c];
 
     regenerate_fake_idfv();
+    acc_set_current_label(nil);   // 複垢：新規垢はまだ無名（名前付き保存されるまでラベル未確定）
     L(@"[acc] light new-device (cleared session, kept onboarding) uuid=%@", newUUID);
 }
 
@@ -790,6 +797,122 @@ static void dump_cookies(void) {
     L(@"[dump] cookies -> Documents/cookies.txt (%d mirrativ cookies)", n);
 }
 
+// ==== mirrativ_gui.py 用に “入力フィールドの中身” を1ファイルに集約して吐く ====
+// GUI の DEFAULTS と同じキー名(device_id/mr_id/idfv/app_ver/model/os_ver)で
+//   Documents/mirrativ_gui.json … GUI が起動時に自動ロードする機械可読ファイル
+//   Documents/mirrativ_gui.txt  … 手貼り用の人間可読ブロック
+// を出力する。live_id / gift_* は実行時に手入力する項目なので含めない。
+static NSString *read_mr_cookie(void) {   // 本アカのセッション identity = mr_id
+    NSHTTPCookieStorage *cs = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+    for (NSHTTPCookie *c in cs.cookies) {
+        NSString *dom = c.domain ?: @"";
+        if ([dom rangeOfString:@"mirrativ" options:NSCaseInsensitiveSearch].location == NSNotFound)
+            continue;
+        if ([c.name caseInsensitiveCompare:@"mr_id"] == NSOrderedSame) return c.value;
+    }
+    return nil;
+}
+
+// ==== 複垢対応：今アクティブなアカウントのラベル（スロット名）を保持 ====
+static NSString *acc_current_label(void) {
+    NSString *s = [NSString stringWithContentsOfFile:docs_path(@"_current_account.txt")
+                                            encoding:NSUTF8StringEncoding error:nil];
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return s.length ? s : nil;
+}
+static void acc_set_current_label(NSString *name) {
+    NSString *p = docs_path(@"_current_account.txt");
+    NSString *n = [name stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (n.length) [n writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    else          [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
+}
+
+// mirrativ_accounts.json に、アクティブ垢の設定を mr_id をキーに upsert（複垢を蓄積）
+static void gui_write_accounts(NSDictionary *cfg, NSString *label) {
+    NSString *mr = cfg[@"mr_id"];
+    if (![mr isKindOfClass:NSString.class] || mr.length == 0) return;   // アクティブ垢のみ記録
+
+    NSString *path = docs_path(@"mirrativ_accounts.json");
+    NSMutableArray *accts = [NSMutableArray array];
+    NSData *old = [NSData dataWithContentsOfFile:path];
+    if (old) {
+        id root = [NSJSONSerialization JSONObjectWithData:old options:0 error:nil];
+        id arr  = [root isKindOfClass:NSDictionary.class] ? root[@"accounts"] : root;
+        if ([arr isKindOfClass:NSArray.class])
+            for (id e in arr) if ([e isKindOfClass:NSDictionary.class]) [accts addObject:[e mutableCopy]];
+    }
+
+    NSMutableDictionary *entry = [cfg mutableCopy];
+    entry[@"label"]   = label.length ? label
+                        : [@"acct-" stringByAppendingString:(mr.length > 4 ? [mr substringFromIndex:mr.length - 4] : mr)];
+    entry[@"updated"] = [NSString stringWithFormat:@"%.0f", [[NSDate date] timeIntervalSince1970]];
+
+    BOOL replaced = NO;
+    for (NSUInteger i = 0; i < accts.count; i++) {
+        id em = accts[i][@"mr_id"];
+        if ([em isKindOfClass:NSString.class] && [em isEqualToString:mr]) {
+            accts[i] = entry; replaced = YES; break;
+        }
+    }
+    if (!replaced) [accts addObject:entry];
+
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:@{ @"accounts": accts }
+                                                options:NSJSONWritingPrettyPrinted error:nil];
+    if (jd) [jd writeToFile:path atomically:YES];
+    L(@"[gui] accounts upsert label=%@ total=%lu", entry[@"label"], (unsigned long)accts.count);
+}
+static void dump_gui_config(void) {
+    NSString *SUITE = @"group.com.dena.mirrativ.shared";
+    NSString *kc  = read_keychain_uuid();
+    NSString *std = [[NSUserDefaults standardUserDefaults] stringForKey:@"deviceUUID"];
+    NSString *grp = [[[NSUserDefaults alloc] initWithSuiteName:SUITE] stringForKey:@"deviceUUID"];
+    NSString *device_id = grp ?: (kc ?: std);   // 実効 device_id（getUUID の優先順）
+    NSString *idfv  = g_fakeIDFV ?: [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+    NSString *ver   = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+    NSString *os    = [[UIDevice currentDevice] systemVersion];
+    NSString *model = device_model();
+    NSString *mr_id = read_mr_cookie();
+
+    // GUI の DEFAULTS キーに一致させる。値が無い項目は空文字（GUI 側で既定を残せる）。
+    NSDictionary *cfg = @{
+        @"device_id": device_id ?: @"",
+        @"mr_id":     mr_id     ?: @"",
+        @"idfv":      idfv      ?: @"",
+        @"app_ver":   ver       ?: @"",
+        @"model":     model     ?: @"",
+        @"os_ver":    os        ?: @"",
+    };
+
+    NSError *je = nil;
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:cfg
+                                                options:NSJSONWritingPrettyPrinted
+                                                  error:&je];
+    if (jd) {
+        [jd writeToFile:docs_path(@"mirrativ_gui.json") atomically:YES];
+    } else {
+        L(@"[gui] json serialize failed: %@", je.localizedDescription);
+    }
+
+    // 手貼り用（GUI の DEFAULTS にそのまま写せる形）
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"# mirrativ_gui.py 用 抽出結果  %@\n", [NSDate date]];
+    [s appendString:@"# Documents/mirrativ_gui.json を GUI が自動ロードします（手貼り不要）。\n"];
+    [s appendString:@"# 手で入れる場合は下記を各フィールドへ。\n\n"];
+    [s appendFormat:@"device_id = %@\n", device_id ?: @"(nil)"];
+    [s appendFormat:@"mr_id     = %@\n", mr_id     ?: @"(nil / 未ログイン)"];
+    [s appendFormat:@"idfv      = %@\n", idfv      ?: @"(nil)"];
+    [s appendFormat:@"app_ver   = %@\n", ver       ?: @"(nil)"];
+    [s appendFormat:@"model     = %@\n", model];
+    [s appendFormat:@"os_ver    = %@\n", os        ?: @"(nil)"];
+    [s writeToFile:docs_path(@"mirrativ_gui.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    // 複垢蓄積：アクティブ垢を mirrativ_accounts.json に upsert（現在のスロット名でラベル）
+    gui_write_accounts(cfg, acc_current_label());
+
+    L(@"[gui] config -> Documents/mirrativ_gui.json (mr_id=%@)",
+      mr_id ? @"present" : @"none");
+}
+
 // dylib ロード時（アプリの main より前）に1回だけ実行される
 __attribute__((constructor))
 static void reset_gate(void) {
@@ -805,10 +928,11 @@ static void reset_gate(void) {
             load_fake_idfv();
             install_idfv_spoof();
             dump_device_id();   // 復元したアカウントの device_id も吐く
+            dump_gui_config();  // GUI 用に device_id/idfv/... をまとめて吐く（mr_id は active で補完）
             [[NSNotificationCenter defaultCenter]
                 addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
                              queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); install_name_limit_hook(); dump_cookies(); }];
+                        usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); install_name_limit_hook(); dump_cookies(); dump_gui_config(); }];
             return;
         }
 
@@ -847,6 +971,8 @@ static void reset_gate(void) {
         dump_device_id();
         // 永続化済み cookie(mr_id 等) を吐く（前回セッションの本アカ cookie を回収）
         dump_cookies();
+        // GUI(mirrativ_gui.py)の入力フィールドの中身を1ファイルに集約して吐く
+        dump_gui_config();
 
         // 状態を Documents に追記（ログ不要の確認用）
         NSString *line = [NSString stringWithFormat:@"%@  armed=%d fakeIDFV=%@ bundleID=%@\n",
@@ -866,6 +992,6 @@ static void reset_gate(void) {
             addObserverForName:UIApplicationDidBecomeActiveNotification
                         object:nil
                          queue:[NSOperationQueue mainQueue]
-                    usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); install_name_limit_hook(); dump_cookies(); }];
+                    usingBlock:^(NSNotification *n){ bg_install_ui(); install_onbo_autocreate(); install_name_limit_hook(); dump_cookies(); dump_gui_config(); }];
     }
 }
