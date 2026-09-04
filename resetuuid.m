@@ -514,16 +514,20 @@ static UIViewController *bg_top_vc(void) {
 }
 - (void)netLogMenu {
     NSFileManager *fm = [NSFileManager defaultManager];
-    BOOL on = [fm fileExistsAtPath:docs_path(@"NET_LOG")];
+    BOOL on  = [fm fileExistsAtPath:docs_path(@"NET_LOG")];
+    BOOL all = [fm fileExistsAtPath:docs_path(@"NET_LOG_ALL")];
     unsigned long long sz = [[fm attributesOfItemAtPath:docs_path(@"net_dump.txt") error:nil] fileSize];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"通信ログ"
-        message:[NSString stringWithFormat:@"捕捉: %@ / net_dump.txt: %llu bytes\n\nONにして『%@』にギフトを1回送る→OFF→net_dump.txt を回収。gift/send の URL・ヘッダ（署名）・ボディが記録されます。",
-                 on ? @"ON" : @"OFF", sz, @"配信"]
+        message:[NSString stringWithFormat:@"絞込(POST/gift): %@ / 全API(GETも): %@\nnet_dump.txt: %llu bytes\n\n全APIをONにして目的の操作（例: ミッション受け取り）を1回する→OFF→net_dump.txt を回収。",
+                 on ? @"ON" : @"OFF", all ? @"ON" : @"OFF", sz]
         preferredStyle:UIAlertControllerStyleActionSheet];
-    [ac addAction:[UIAlertAction actionWithTitle:(on ? @"捕捉を OFF にする" : @"捕捉を ON にする")
-        style:(on ? UIAlertActionStyleDefault : UIAlertActionStyleDefault) handler:^(UIAlertAction *x) {
+    [ac addAction:[UIAlertAction actionWithTitle:(on ? @"絞込捕捉を OFF" : @"絞込捕捉を ON（POST/gift）") style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
         if (on) [fm removeItemAtPath:docs_path(@"NET_LOG") error:nil];
         else    [[NSData data] writeToFile:docs_path(@"NET_LOG") atomically:YES];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:(all ? @"全API捕捉を OFF" : @"全API捕捉を ON（GETも含む）") style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        if (all) [fm removeItemAtPath:docs_path(@"NET_LOG_ALL") error:nil];
+        else     [[NSData data] writeToFile:docs_path(@"NET_LOG_ALL") atomically:YES];
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"net_dump.txt を消去" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
         [fm removeItemAtPath:docs_path(@"net_dump.txt") error:nil];
@@ -938,18 +942,24 @@ static void dump_gui_config(void) {
 // Documents/NET_LOG がある時だけ、mirrativ 宛の POST（と /gift 系）を
 // URL・全ヘッダ（署名含む）・ボディ付きで Documents/net_dump.txt に追記する。
 // これで gift/send の“本物”のパラメータ・署名ヘッダが分かり、Python から再現できる。
-static BOOL net_log_on(void) {
+static BOOL net_log_on(void) {   // 絞り込み捕捉（POST と /gift のみ）
     return [[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"NET_LOG")];
+}
+static BOOL net_log_all(void) {  // 全API捕捉（GETも含む。mission 調査用）
+    return [[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"NET_LOG_ALL")];
 }
 static void net_dump_request(NSURLRequest *req, NSData *bodyOverride) {
     @try {
-        if (!net_log_on()) return;
+        BOOL on = net_log_on(), all = net_log_all();
+        if (!on && !all) return;
         NSString *url = req.URL.absoluteString ?: @"";
         if ([url rangeOfString:@"mirrativ" options:NSCaseInsensitiveSearch].location == NSNotFound) return;
+        if ([url rangeOfString:@"cdn.mirrativ.com" options:NSCaseInsensitiveSearch].location != NSNotFound) return;   // 画像等は除外
+        if ([url rangeOfString:@"clog.mirrativ.com" options:NSCaseInsensitiveSearch].location != NSNotFound) return;  // 分析ログは除外
         NSString *method = req.HTTPMethod ?: @"GET";
         BOOL isPost = [method caseInsensitiveCompare:@"POST"] == NSOrderedSame;
         BOOL isGift = [url rangeOfString:@"gift" options:NSCaseInsensitiveSearch].location != NSNotFound;
-        if (!isPost && !isGift) return;   // 書き込み(POST)と gift 系だけに絞る
+        if (!all && !isPost && !isGift) return;   // 絞り込み時は POST と gift だけ（全API時は全部）
 
         NSString *path = docs_path(@"net_dump.txt");
         NSFileManager *fm = [NSFileManager defaultManager];
