@@ -170,6 +170,15 @@ static NSArray<NSString *> *acc_list(void) {
     }
     return [r sortedArrayUsingSelector:@selector(compare:)];
 }
+// 既存と衝突しない自動スロット名（サブ1, サブ2, …）を返す
+static NSString *acc_suggest_name(void) {
+    NSSet *set = [NSSet setWithArray:acc_list()];
+    for (int i = 1; i < 1000; i++) {
+        NSString *n = [NSString stringWithFormat:@"サブ%d", i];
+        if (![set containsObject:n]) return n;
+    }
+    return [NSString stringWithFormat:@"acct-%ld", (long)time(NULL)];
+}
 // ★prefs は cfprefsd 管理なので、ファイル直書きでなく NSUserDefaults API 経由で保存/復元する
 static void acc_snapshot(NSString *name) {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -409,8 +418,151 @@ static UIViewController *bg_top_vc(void) {
     return vc;
 }
 
+// ==== 複垢アクション（アプリ内から HTTP を叩く：Pythonツールのネイティブ版）====
+// mirrativ_accounts.json を読み、各垢を独立セッション(mr_id cookie + x-uuid)で叩く。
+static NSArray<NSDictionary *> *mrv_load_accounts(void) {
+    NSData *d = [NSData dataWithContentsOfFile:docs_path(@"mirrativ_accounts.json")];
+    if (!d) return @[];
+    id root = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    id arr = [root isKindOfClass:NSDictionary.class] ? root[@"accounts"] : root;
+    if (![arr isKindOfClass:NSArray.class]) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (id e in arr)
+        if ([e isKindOfClass:NSDictionary.class] &&
+            [e[@"mr_id"] isKindOfClass:NSString.class] && [e[@"mr_id"] length])
+            [out addObject:e];
+    return out;
+}
+static NSString *mrv_enc(NSString *s) {
+    static NSCharacterSet *allowed; static dispatch_once_t once;
+    dispatch_once(&once, ^{ allowed = [NSCharacterSet characterSetWithCharactersInString:
+        @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"]; });
+    return [([s isKindOfClass:NSString.class] ? s : [NSString stringWithFormat:@"%@", s])
+            stringByAddingPercentEncodingWithAllowedCharacters:allowed] ?: @"";
+}
+static NSString *mrv_form(NSDictionary *body) {
+    NSMutableArray *p = [NSMutableArray array];
+    for (NSString *k in body) [p addObject:[NSString stringWithFormat:@"%@=%@", mrv_enc(k), mrv_enc(body[k])]];
+    return [p componentsJoinedByString:@"&"];
+}
+// 同期的に1リクエスト実行。JSON(dict)を返す。HTTPコードは httpOut に。
+static NSDictionary *mrv_api(NSDictionary *acct, NSString *method, NSString *path,
+                            NSDictionary *body, NSInteger *httpOut) {
+    NSString *urlStr = [@"https://www.mirrativ.com" stringByAppendingString:path];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
+    req.HTTPMethod = method;
+    req.HTTPShouldHandleCookies = NO;
+    NSString *ua = [NSString stringWithFormat:@"MR_APP/%@/iOS/%@/%@",
+                    acct[@"app_ver"] ?: @"", acct[@"model"] ?: @"iPhone", acct[@"os_ver"] ?: @""];
+    [req setValue:ua forHTTPHeaderField:@"User-Agent"];
+    [req setValue:(acct[@"device_id"] ?: @"") forHTTPHeaderField:@"x-uuid"];
+    [req setValue:(acct[@"device_id"] ?: @"") forHTTPHeaderField:@"device_id"];
+    [req setValue:(acct[@"idfv"] ?: @"") forHTTPHeaderField:@"x-idfv"];
+    [req setValue:@"live_view" forHTTPHeaderField:@"x-referer"];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+    [req setValue:[NSString stringWithFormat:@"mr_id=%@; lang=ja", acct[@"mr_id"] ?: @""]
+        forHTTPHeaderField:@"Cookie"];
+    [req setValue:[NSString stringWithFormat:@"%.6f", [[NSDate date] timeIntervalSince1970]]
+        forHTTPHeaderField:@"x-client-unixtime"];
+    if ([method caseInsensitiveCompare:@"POST"] == NSOrderedSame) {
+        [req setValue:@"application/x-www-form-urlencoded; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+        req.HTTPBody = [mrv_form(body) dataUsingEncoding:NSUTF8StringEncoding];
+    }
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    cfg.HTTPCookieStorage = nil; cfg.HTTPShouldSetCookies = NO;
+    NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg];
+    __block NSDictionary *result = nil; __block NSInteger code = 0;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    NSURLSessionDataTask *t = [sess dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            if ([resp isKindOfClass:NSHTTPURLResponse.class]) code = [(NSHTTPURLResponse *)resp statusCode];
+            if (data) {
+                id j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                if ([j isKindOfClass:NSDictionary.class]) result = j;
+            }
+            dispatch_semaphore_signal(sem);
+        }];
+    [t resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
+    if (httpOut) *httpOut = code;
+    return result;
+}
+static BOOL mrv_ok(NSDictionary *json, NSString **msgOut) {
+    if (![json isKindOfClass:NSDictionary.class]) { if (msgOut) *msgOut = @"(no json)"; return NO; }
+    NSDictionary *st = [json[@"status"] isKindOfClass:NSDictionary.class] ? json[@"status"] : json;
+    id flag = st[@"ok"]; if (flag == nil) flag = json[@"ok"];
+    NSString *msg = st[@"error"];
+    if (![msg isKindOfClass:NSString.class] || !msg.length) msg = st[@"message"];
+    if (![msg isKindOfClass:NSString.class] || !msg.length) msg = st[@"msg"];
+    if (msgOut) *msgOut = [msg isKindOfClass:NSString.class] ? msg : @"";
+    return ([flag isKindOfClass:NSNumber.class] && [flag integerValue] != 0) ||
+           [flag isEqual:@"1"];
+}
+// gift/panels から指定 gift_id が属するパネルの panel_type / reason_id を返す
+static NSDictionary *mrv_gift_panel_for(NSDictionary *panelsJson, NSString *giftId) {
+    id panels = [panelsJson isKindOfClass:NSDictionary.class] ? panelsJson[@"panels"] : nil;
+    if ([panels isKindOfClass:NSArray.class]) {
+        for (id p in panels) {
+            if (![p isKindOfClass:NSDictionary.class]) continue;
+            id pt = p[@"panel_type"] ?: p[@"type"] ?: p[@"tab_type"];
+            id rid = p[@"reason_id"] ?: p[@"panel_reason_id"];
+            id gifts = p[@"gifts"];
+            if (![gifts isKindOfClass:NSArray.class]) continue;
+            for (id g in gifts) {
+                if (![g isKindOfClass:NSDictionary.class]) continue;
+                id gid = g[@"gift_id"] ?: g[@"id"];
+                if (gid && [[NSString stringWithFormat:@"%@", gid] isEqualToString:giftId])
+                    return @{ @"panel_type": pt  ? [NSString stringWithFormat:@"%@", pt]  : @"",
+                              @"reason_id":  rid ? [NSString stringWithFormat:@"%@", rid] : @"" };
+            }
+        }
+    }
+    return @{ @"panel_type": @"", @"reason_id": @"" };
+}
+static void mrv_walk_missions(id o, NSMutableArray *ids) {
+    if ([o isKindOfClass:NSDictionary.class]) {
+        NSDictionary *d = o;
+        if (d[@"id"] && (d[@"progress_status"] || d[@"reward_num"] || d[@"reward_text"] || d[@"status"]))
+            [ids addObject:[NSString stringWithFormat:@"%@", d[@"id"]]];
+        for (id v in [d allValues]) mrv_walk_missions(v, ids);
+    } else if ([o isKindOfClass:NSArray.class]) {
+        for (id v in o) mrv_walk_missions(v, ids);
+    }
+}
+static NSArray *mrv_mission_ids(NSDictionary *json) {
+    NSMutableArray *ids = [NSMutableArray array];
+    mrv_walk_missions(json, ids);
+    NSMutableArray *u = [NSMutableArray array];
+    for (NSString *x in ids) if (![u containsObject:x]) [u addObject:x];
+    return u;
+}
+// 配信URL/共有URL/素IDから live_id を取り出す
+static NSString *mrv_parse_live_id(NSString *text) {
+    NSString *t = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!t.length) return @"";
+    if ([t rangeOfString:@"/"].location == NSNotFound &&
+        [t rangeOfString:@"%"].location == NSNotFound &&
+        [t rangeOfString:@":"].location == NSNotFound) return t;
+    NSString *prev = @"", *cur = t;
+    for (int i = 0; i < 5 && ![cur isEqualToString:prev]; i++) {
+        prev = cur; cur = [cur stringByRemovingPercentEncoding] ?: cur;
+    }
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"live/([A-Za-z0-9_-]+)"
+                                                                       options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:cur options:0 range:NSMakeRange(0, cur.length)];
+    if (m && m.numberOfRanges > 1) return [cur substringWithRange:[m rangeAtIndex:1]];
+    return t;
+}
+
 @interface MRVBGTool : UIViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property(nonatomic,strong) UIButton *btn;
+- (void)multiToolMenu;
+- (void)giftFlow;
+- (void)enterFlow;
+- (void)runMissionAll;
+- (void)doGiftLive:(NSString *)live gift:(NSString *)gid count:(NSInteger)n;
+- (void)askText:(NSString *)title placeholder:(NSString *)ph completion:(void (^)(NSString *))cb;
+- (void)showResult:(NSString *)title body:(NSString *)body;
 @end
 @implementation MRVBGTool
 - (void)loadView { self.view = [UIView new]; self.view.backgroundColor = UIColor.clearColor; }
@@ -462,6 +614,7 @@ static UIViewController *bg_top_vc(void) {
     [ac addAction:[UIAlertAction actionWithTitle:@"👥 アカウント切替" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self accMenu]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🔄 新規アカにする（自動ログイン）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self lightNewNow]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🆕 新規アカ作成（名前つき保存）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self newAccountNamed]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🚀 複垢ツール（送信/ミッション）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self multiToolMenu]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🌐 通信ログ（gift/send捕捉）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self netLogMenu]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🧹 完全初期化（トラブル時）" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){ [self deviceResetNow]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
@@ -486,8 +639,8 @@ static UIViewController *bg_top_vc(void) {
     [self confirmRelaunch:@"次に開いた時に完全初期化されます（初回起動状態）。通常は『新規アカにする』で十分です。"];
 }
 - (void)newAccountNamed {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"新規アカ作成（名前つき保存）" message:@"作る新アカのスロット名を入力" preferredStyle:UIAlertControllerStyleAlert];
-    [a addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.placeholder = @"例: サブ2"; }];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"新規アカ作成（名前つき保存）" message:@"作る新アカのスロット名（自動入力済み・変更可）" preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.placeholder = @"例: サブ2"; tf.text = acc_suggest_name(); tf.clearButtonMode = UITextFieldViewModeWhileEditing; }];
     [a addAction:[UIAlertAction actionWithTitle:@"作成" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){
         NSString *name = [a.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         name = [name stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
@@ -511,6 +664,113 @@ static UIViewController *bg_top_vc(void) {
     [ac addAction:[UIAlertAction actionWithTitle:(on?@"差し替えを OFF にする":@"差し替えを ON にする") style:on?UIAlertActionStyleDestructive:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self setSwap:!on]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
+}
+// ==== 複垢ツール UI ====
+- (void)askText:(NSString *)title placeholder:(NSString *)ph completion:(void (^)(NSString *))cb {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:nil preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = ph;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        cb(a.textFields.firstObject.text ?: @"");
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:a];
+}
+- (void)showResult:(NSString *)title body:(NSString *)body {
+    [body writeToFile:docs_path(@"run_log.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:body preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self present:a];
+    });
+}
+- (void)multiToolMenu {
+    NSArray *accts = mrv_load_accounts();
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"複垢ツール"
+        message:[NSString stringWithFormat:@"認証情報 %lu 垢（mirrativ_accounts.json）", (unsigned long)accts.count]
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🎁 全垢ギフト送信" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self giftFlow]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🎯 全垢ミッション受取(tutorial)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self runMissionAll]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"👀 全垢入室確認" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self enterFlow]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:ac];
+}
+- (void)giftFlow {
+    [self askText:@"配信URL または live_id" placeholder:@"https://... / cFb7..." completion:^(NSString *u) {
+        NSString *live = mrv_parse_live_id(u);
+        if (!live.length) { [self alert:@"エラー" msg:@"live_id を取得できません"]; return; }
+        [self askText:@"gift_id" placeholder:@"例: 2" completion:^(NSString *gid) {
+            NSString *g = [gid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (!g.length) { [self alert:@"エラー" msg:@"gift_id が空です"]; return; }
+            [self askText:@"個数 (count)" placeholder:@"1" completion:^(NSString *c) {
+                NSInteger n = [c integerValue]; if (n < 1) n = 1;
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    [self doGiftLive:live gift:g count:n];
+                });
+            }];
+        }];
+    }];
+}
+- (void)doGiftLive:(NSString *)live gift:(NSString *)gid count:(NSInteger)n {
+    NSArray *accts = mrv_load_accounts();
+    NSMutableString *log = [NSMutableString stringWithFormat:@"live=%@ gift=%@ count=%ld\n\n", live, gid, (long)n];
+    int okc = 0;
+    for (NSDictionary *a in accts) {
+        NSInteger http = 0;
+        NSDictionary *panels = mrv_api(a, @"GET", [@"/api/gift/panels?live_id=" stringByAppendingString:live], nil, &http);
+        NSDictionary *pinfo = mrv_gift_panel_for(panels, gid);
+        mrv_api(a, @"GET", [@"/api/live/live?live_id=" stringByAppendingString:live], nil, &http);   // 入室
+        NSDictionary *body = @{ @"count": [@(n) stringValue], @"gift_id": gid, @"live_id": live,
+                                @"message": @"", @"panel_reason_id": pinfo[@"reason_id"], @"panel_type": pinfo[@"panel_type"] };
+        NSString *msg = nil;
+        BOOL ok = mrv_ok(mrv_api(a, @"POST", @"/api/gift/send", body, &http), &msg);
+        if (ok) okc++;
+        [log appendFormat:@"%@: %@ %@\n", a[@"label"] ?: @"?", ok ? @"✔成功" : @"✖",
+            ok ? @"" : (msg.length ? msg : [NSString stringWithFormat:@"HTTP %ld", (long)http])];
+    }
+    [log appendFormat:@"\n成功 %d / %lu 垢", okc, (unsigned long)accts.count];
+    [self showResult:@"ギフト送信結果" body:log];
+}
+- (void)runMissionAll {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSArray *accts = mrv_load_accounts();
+        NSMutableString *log = [NSMutableString string];
+        for (NSDictionary *a in accts) {
+            NSInteger http = 0;
+            NSArray *ids = mrv_mission_ids(mrv_api(a, @"GET", @"/api/mission/tutorial", nil, &http));
+            int got = 0; NSString *lastErr = nil;
+            for (NSString *mid in ids) {
+                NSString *msg = nil;
+                if (mrv_ok(mrv_api(a, @"POST", @"/api/mission/receive_reward",
+                                   @{ @"mission_id": mid, @"mission_period": @"tutorial" }, &http), &msg))
+                    got++;
+                else if (msg.length) lastErr = msg;
+            }
+            [log appendFormat:@"%@: %d件受取%@\n", a[@"label"] ?: @"?", got,
+                (got == 0 && lastErr) ? [@"  / " stringByAppendingString:lastErr] : @""];
+        }
+        [self showResult:@"ミッション受取結果" body:log];
+    });
+}
+- (void)enterFlow {
+    [self askText:@"配信URL または live_id" placeholder:@"..." completion:^(NSString *u) {
+        NSString *live = mrv_parse_live_id(u);
+        if (!live.length) { [self alert:@"エラー" msg:@"live_id 取得不可"]; return; }
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSArray *accts = mrv_load_accounts();
+            NSMutableString *log = [NSMutableString string];
+            for (NSDictionary *a in accts) {
+                NSInteger http = 0;
+                NSDictionary *lv = mrv_api(a, @"GET", [@"/api/live/live?live_id=" stringByAppendingString:live], nil, &http);
+                id onu = [lv isKindOfClass:NSDictionary.class] ? lv[@"online_user_num"] : nil;
+                [log appendFormat:@"%@: HTTP%ld online=%@\n", a[@"label"] ?: @"?", (long)http, onu ?: @"?"];
+            }
+            [self showResult:@"入室確認結果" body:log];
+        });
+    }];
 }
 - (void)netLogMenu {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -570,8 +830,12 @@ static UIViewController *bg_top_vc(void) {
     [self confirmRelaunch:[NSString stringWithFormat:@"次に開いた時に「%@」へ切り替わります。", name]];
 }
 - (void)accDelete {
+    NSArray<NSString *> *slots = acc_list();
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"削除するスロット" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-    for (NSString *n in acc_list()) {
+    if (slots.count)
+        [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"⚠️ 全%lu件を一括削除", (unsigned long)slots.count]
+            style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){ [self accDeleteAll]; }]];
+    for (NSString *n in slots) {
         [ac addAction:[UIAlertAction actionWithTitle:n style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){
             [[NSFileManager defaultManager] removeItemAtPath:acc_slot(n) error:nil];
             [self alert:@"削除しました" msg:n];
@@ -579,6 +843,21 @@ static UIViewController *bg_top_vc(void) {
     }
     [ac addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
+}
+- (void)accDeleteAll {
+    NSArray<NSString *> *slots = acc_list();
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"全スロット削除"
+        message:[NSString stringWithFormat:@"保存済みの %lu 件をすべて削除します。元に戻せません。よろしいですか？", (unsigned long)slots.count]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"全部削除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSUInteger n = 0;
+        for (NSString *s in slots)
+            if ([fm removeItemAtPath:acc_slot(s) error:nil]) n++;
+        [self alert:@"削除しました" msg:[NSString stringWithFormat:@"%lu 件のスロットを削除しました。", (unsigned long)n]];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
+    [self present:a];
 }
 - (void)pickPhoto {
     dispatch_async(dispatch_get_main_queue(), ^{   // アクションシート dismiss 後に確実に出す
