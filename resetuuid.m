@@ -170,14 +170,28 @@ static NSArray<NSString *> *acc_list(void) {
     }
     return [r sortedArrayUsingSelector:@selector(compare:)];
 }
-// 既存と衝突しない自動スロット名（サブ1, サブ2, …）を返す
+// 「サブN」の N を取り出す（違えば0）
+static NSInteger sub_num_of(NSString *name) {
+    if (![name hasPrefix:@"サブ"]) return 0;
+    NSString *num = [name substringFromIndex:[@"サブ" length]];
+    if (!num.length) return 0;
+    if ([num rangeOfCharacterFromSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location != NSNotFound) return 0;
+    return [num integerValue];
+}
+// 採番カウンタ（作成確定ごとに進める。遅延保存でスロット未生成でも増える）
+static NSInteger sub_seq_get(void) {
+    NSString *s = [NSString stringWithContentsOfFile:docs_path(@"_sub_seq.txt") encoding:NSUTF8StringEncoding error:nil];
+    return s ? [s integerValue] : 0;
+}
+static void sub_seq_set(NSInteger n) {
+    [[NSString stringWithFormat:@"%ld", (long)n] writeToFile:docs_path(@"_sub_seq.txt")
+        atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+// 既存スロット と カウンタ の最大 +1 を自動スロット名（サブ1, サブ2, …）として返す
 static NSString *acc_suggest_name(void) {
-    NSSet *set = [NSSet setWithArray:acc_list()];
-    for (int i = 1; i < 1000; i++) {
-        NSString *n = [NSString stringWithFormat:@"サブ%d", i];
-        if (![set containsObject:n]) return n;
-    }
-    return [NSString stringWithFormat:@"acct-%ld", (long)time(NULL)];
+    NSInteger mx = sub_seq_get();
+    for (NSString *n in acc_list()) { NSInteger k = sub_num_of(n); if (k > mx) mx = k; }
+    return [NSString stringWithFormat:@"サブ%ld", (long)(mx + 1)];
 }
 // ★prefs は cfprefsd 管理なので、ファイル直書きでなく NSUserDefaults API 経由で保存/復元する
 static void acc_snapshot(NSString *name) {
@@ -554,6 +568,24 @@ static NSString *mrv_parse_live_id(NSString *text) {
     return t;
 }
 
+// mirrativ_accounts.json から指定 label のエントリを削除（スロット削除と同期）
+static void gui_accounts_remove_label(NSString *label) {
+    NSString *path = docs_path(@"mirrativ_accounts.json");
+    NSData *d = [NSData dataWithContentsOfFile:path];
+    if (!d) return;
+    id root = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    id arr = [root isKindOfClass:NSDictionary.class] ? root[@"accounts"] : root;
+    if (![arr isKindOfClass:NSArray.class]) return;
+    NSMutableArray *keep = [NSMutableArray array];
+    for (id e in arr) {
+        NSString *lb = [e isKindOfClass:NSDictionary.class] ? e[@"label"] : nil;
+        if (![lb isKindOfClass:NSString.class] || ![lb isEqualToString:label]) [keep addObject:e];
+    }
+    NSData *out = [NSJSONSerialization dataWithJSONObject:@{ @"accounts": keep }
+                                                 options:NSJSONWritingPrettyPrinted error:nil];
+    if (out) [out writeToFile:path atomically:YES];
+}
+
 @interface MRVBGTool : UIViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property(nonatomic,strong) UIButton *btn;
 - (void)multiToolMenu;
@@ -645,6 +677,8 @@ static NSString *mrv_parse_live_id(NSString *text) {
         NSString *name = [a.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         name = [name stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
         if (!name.length) { [self alert:@"失敗" msg:@"名前が空です"]; return; }
+        NSInteger k = sub_num_of(name);   // 「サブN」なら採番を進める（遅延保存でも次はN+1が出る）
+        if (k > sub_seq_get()) sub_seq_set(k);
         [[NSData data] writeToFile:docs_path(@"NEW_LIGHT") atomically:YES];           // 新UUID＋セッション消去
         [[NSData data] writeToFile:docs_path(@"AUTO_CREATE") atomically:YES];         // 「はじめる」自動タップ
         [name writeToFile:docs_path(@"_autosave_name.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil]; // 起動後に自動保存
@@ -838,6 +872,7 @@ static NSString *mrv_parse_live_id(NSString *text) {
     for (NSString *n in slots) {
         [ac addAction:[UIAlertAction actionWithTitle:n style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){
             [[NSFileManager defaultManager] removeItemAtPath:acc_slot(n) error:nil];
+            gui_accounts_remove_label(n);   // JSONの該当エントリも同期削除
             [self alert:@"削除しました" msg:n];
         }]];
     }
@@ -854,7 +889,8 @@ static NSString *mrv_parse_live_id(NSString *text) {
         NSUInteger n = 0;
         for (NSString *s in slots)
             if ([fm removeItemAtPath:acc_slot(s) error:nil]) n++;
-        [self alert:@"削除しました" msg:[NSString stringWithFormat:@"%lu 件のスロットを削除しました。", (unsigned long)n]];
+        [fm removeItemAtPath:docs_path(@"mirrativ_accounts.json") error:nil];   // JSONも丸ごとクリア
+        [self alert:@"削除しました" msg:[NSString stringWithFormat:@"%lu 件のスロットと accounts.json を削除しました。", (unsigned long)n]];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
     [self present:a];
