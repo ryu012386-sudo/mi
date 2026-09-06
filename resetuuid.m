@@ -122,6 +122,8 @@ static NSString *acc_slot(NSString *n)    { return [acc_dir() stringByAppendingP
 static void acc_set_current_label(NSString *name);
 static NSString *read_keychain_uuid(void);
 static NSString *read_mr_cookie(void);
+// 新規垢の年齢＋名前を API で設定（profile_edit）。実体は下部で定義。
+static void set_new_account_profile(NSString *name);
 // 新規垢が確立したか（device UUID が keychain にあり、mr_id cookie も付いた）
 static BOOL acc_is_established(void) {
     NSString *kc = read_keychain_uuid();
@@ -278,6 +280,14 @@ static void acc_schedule_autosave(void) {
         if (done) return;
         if (!acc_is_established()) { L(@"[acc] autosave wait (%@): 未確立", why); return; }
         done = YES;
+        // 垢が確立したら、入力名を API で設定（year/birthday＋profile_edit の name）
+        NSString *nick = [[NSString stringWithContentsOfFile:docs_path(@"_create_name.txt")
+                                                    encoding:NSUTF8StringEncoding error:nil]
+                          stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (nick.length) {
+            set_new_account_profile(nick);
+            [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_create_name.txt") error:nil];
+        }
         acc_snapshot(name);
         acc_set_current_label(name);
         [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_autosave_name.txt") error:nil];
@@ -348,16 +358,7 @@ static void acc_dump_pref_keys(void) {
     [s writeToFile:docs_path(@"prefs_dump.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
-// ==== 新規アカ自動作成：ニックネーム自動入力＋「作成」を自動タップ ====
-// 前面のキーウィンドウから最初の UITextField を再帰的に探す
-static UITextField *onbo_find_textfield(UIView *v) {
-    if ([v isKindOfClass:UITextField.class] && !v.hidden) return (UITextField *)v;
-    for (UIView *sub in v.subviews) {
-        UITextField *tf = onbo_find_textfield(sub);
-        if (tf) return tf;
-    }
-    return nil;
-}
+// ==== 新規アカ自動作成：「はじめる/作成」を自動タップ（名前/年齢は後で API 設定）====
 static UIView *onbo_top_view(id fallbackVC) {
     for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
         if ([sc isKindOfClass:UIWindowScene.class] &&
@@ -373,43 +374,24 @@ static void my_onbo_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (g_orig_onbo_vda) g_orig_onbo_vda(self, _cmd, animated);
     if (![[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"AUTO_CREATE")]) return;
     [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"AUTO_CREATE") error:nil];  // 消費（一度だけ）
-    // 入力したいニックネーム（名前つき作成で書かれる）。無ければ空。
-    NSString *nick = [[NSString stringWithContentsOfFile:docs_path(@"_create_name.txt")
-                                                encoding:NSUTF8StringEncoding error:nil]
-                      stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    // ボタン未生成／名前欄未表示に備え、押せるまで 0.5秒ごとに最大~20秒リトライ。
-    // 各回：まず名前欄にニックネームを入れて editingChanged を発火 → 作成ボタンをタップ。
+    // 「はじめる/作成」ボタンを、押せるまで 0.5秒ごとに最大~20秒リトライして起動。
+    // 名前と年齢は垢確立後に API(set_new_account_profile) で設定するので、ここでは入力しない。
     __weak id wself = self;
     __block int tries = 0;
-    __block BOOL filled = NO;
     __block void (^tap)(void) = nil;
     tap = ^{
         id s = wself;
         if (!s) { tap = nil; return; }
         @try {
-            // 1) ニックネームを名前欄へ（一度入れられたら以後は維持）
-            if (nick.length && !filled) {
-                UITextField *tf = onbo_find_textfield(onbo_top_view(s));
-                if (tf) {
-                    tf.text = nick;
-                    [tf sendActionsForControlEvents:UIControlEventEditingChanged];
-                    [tf sendActionsForControlEvents:UIControlEventValueChanged];
-                    filled = YES;
-                    L(@"[acc] nickname filled: %@", nick);
-                }
-            }
-            // 2) 作成ボタンをタップ（名前必須なら 1) で有効化されてから通る）
             SEL sel = NSSelectorFromString(@"createAccountButton");
             UIButton *b = [s respondsToSelector:sel] ? ((UIButton *(*)(id, SEL))objc_msgSend)(s, sel) : nil;
-            BOOL ready = (nick.length == 0) || filled;   // 名前入力方式なら埋めてから押す
-            if (b && ready) {
+            if (b) {
                 [b sendActionsForControlEvents:UIControlEventTouchUpInside];
-                L(@"[acc] auto-tapped createAccount (try %d, nick=%@)", tries, nick.length ? nick : @"(none)");
-                [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_create_name.txt") error:nil];
+                L(@"[acc] auto-tapped createAccount (try %d)", tries);
                 tap = nil; return;
             }
-        } @catch (NSException *e) { L(@"[acc] auto-create ex: %@", e); }
-        if (++tries >= 40) { L(@"[acc] auto-create: 名前欄/ボタンが見つからず断念"); tap = nil; return; }
+        } @catch (NSException *e) { L(@"[acc] auto-tap ex: %@", e); }
+        if (++tries >= 40) { L(@"[acc] auto-tap: ボタンが見つからず断念"); tap = nil; return; }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), tap);
     };
@@ -511,6 +493,64 @@ static UIViewController *bg_top_vc(void) {
     UIViewController *vc = best.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
+}
+
+// ==== 新規垢のプロフィール(年齢/名前)を API で設定 ====
+// 実効 device_id（getUUID 優先順: group → keychain → std）
+static NSString *app_device_uuid(void) {
+    NSString *grp = [[[NSUserDefaults alloc] initWithSuiteName:@"group.com.dena.mirrativ.shared"] stringForKey:@"deviceUUID"];
+    if (grp.length) return grp;
+    NSString *kc = read_keychain_uuid();
+    if (kc.length) return kc;
+    return [[NSUserDefaults standardUserDefaults] stringForKey:@"deviceUUID"] ?: @"";
+}
+// アプリ共有の cookie(mr_id) を使って同期POST（現在ログイン中の“この端末の垢”に効く）
+static void app_api_send(NSString *method, NSString *path, NSString *contentType, NSData *body) {
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
+        [NSURL URLWithString:[@"https://www.mirrativ.com" stringByAppendingString:path]]];
+    req.HTTPMethod = method;
+    req.HTTPShouldHandleCookies = YES;   // アプリ共有 cookie(mr_id) を自動付与
+    NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
+    NSString *os  = [[UIDevice currentDevice] systemVersion] ?: @"";
+    char mbuf[64] = {0}; size_t ml = sizeof(mbuf); sysctlbyname("hw.machine", mbuf, &ml, NULL, 0);
+    NSString *model = mbuf[0] ? [NSString stringWithUTF8String:mbuf] : @"iPhone";
+    [req setValue:[NSString stringWithFormat:@"MR_APP/%@/iOS/%@/%@", ver, model, os] forHTTPHeaderField:@"User-Agent"];
+    [req setValue:app_device_uuid() forHTTPHeaderField:@"x-uuid"];
+    NSString *idfv = g_fakeIDFV ?: [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+    [req setValue:(idfv ?: @"") forHTTPHeaderField:@"x-idfv"];
+    [req setValue:@"login" forHTTPHeaderField:@"x-referer"];
+    [req setValue:[NSString stringWithFormat:@"%.6f", [[NSDate date] timeIntervalSince1970]] forHTTPHeaderField:@"x-client-unixtime"];
+    if (contentType) [req setValue:contentType forHTTPHeaderField:@"Content-Type"];
+    if (body) req.HTTPBody = body;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block NSInteger code = 0; __block NSData *rd = nil;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        if ([r isKindOfClass:NSHTTPURLResponse.class]) code = [(NSHTTPURLResponse *)r statusCode];
+        rd = d; dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
+    NSString *bs = rd ? [[NSString alloc] initWithData:rd encoding:NSUTF8StringEncoding] : @"";
+    L(@"[create] %@ %@ -> HTTP %ld %@", method, path, (long)code, bs.length > 140 ? [bs substringToIndex:140] : (bs ?: @""));
+}
+static void set_new_account_profile(NSString *name) {
+    // 年齢ゲート通過（成人の既定値。既設定でも害なし）
+    NSData *dob = [@"birthday=0101&generation=2000" dataUsingEncoding:NSUTF8StringEncoding];
+    app_api_send(@"POST", @"/api/user/check_minor",   @"application/x-www-form-urlencoded; charset=utf-8", dob);
+    app_api_send(@"POST", @"/api/user/date_of_birth", @"application/x-www-form-urlencoded; charset=utf-8", dob);
+    // 名前を設定（multipart/form-data: name, is_avatar_uploaded=0）
+    NSString *boundary = @"----mrvBoundaryDEDA1234567890";
+    NSMutableData *b = [NSMutableData data];
+    void (^add)(NSString *, NSString *) = ^(NSString *n, NSString *v) {
+        [b appendData:[[NSString stringWithFormat:
+            @"--%@\r\nContent-Disposition: form-data; name=\"%@\"\r\nContent-Type: text/plain\r\n\r\n%@\r\n",
+            boundary, n, v] dataUsingEncoding:NSUTF8StringEncoding]];
+    };
+    add(@"is_avatar_uploaded", @"0");
+    add(@"name", name);
+    [b appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    app_api_send(@"POST", @"/api/user/profile_edit",
+                 [NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary], b);
+    L(@"[create] account name set via API: %@", name);
 }
 
 // ==== 複垢アクション（アプリ内から HTTP を叩く：Pythonツールのネイティブ版）====
