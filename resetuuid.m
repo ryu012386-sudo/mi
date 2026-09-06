@@ -118,8 +118,16 @@ static NSData *bg_real_jpeg(UIImage *img) {
 static NSString *acc_dir(void)            { return docs_path(@"accounts"); }
 static NSString *acc_slot(NSString *n)    { return [acc_dir() stringByAppendingPathComponent:n]; }
 
-// 複垢用ラベル管理（実体は下部の dump セクションで定義）
+// 複垢用ラベル管理／確立判定で使う関数（実体は下部の dump セクションで定義）
 static void acc_set_current_label(NSString *name);
+static NSString *read_keychain_uuid(void);
+static NSString *read_mr_cookie(void);
+// 新規垢が確立したか（device UUID が keychain にあり、mr_id cookie も付いた）
+static BOOL acc_is_established(void) {
+    NSString *kc = read_keychain_uuid();
+    NSString *mr = read_mr_cookie();
+    return (kc.length > 0) && (mr.length > 0);
+}
 
 static NSArray<NSString *> *mirrativ_pref_files(void) {
     NSString *prefs = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences"];
@@ -255,27 +263,49 @@ static BOOL acc_restore_pending(void) {
     if (!p.length) return NO;
     return acc_restore(p);
 }
-// 新規アカ作成の自動保存：リセット後、/me で垢が確立してからスナップショット
+// 新規アカ作成の自動保存：垢が“確立”（keychain UUID＋mr_id cookie が揃う）してから保存。
+// 固定30秒だと確立前に空スナップショットしてしまい「保存されない」ことがあったため、
+// 確立するまで3秒ごとに最大120秒ポーリングし、揃った瞬間に保存する。
 static void acc_schedule_autosave(void) {
     NSString *name = [[NSString stringWithContentsOfFile:docs_path(@"_autosave_name.txt")
                                                 encoding:NSUTF8StringEncoding error:nil]
                       stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (!name.length) return;
     static BOOL scheduled = NO; if (scheduled) return; scheduled = YES;
-    void (^doSave)(void) = ^{
-        static BOOL done = NO; if (done) return; done = YES;
+
+    __block BOOL done = NO;
+    void (^trySave)(NSString *) = ^(NSString *why) {
+        if (done) return;
+        if (!acc_is_established()) { L(@"[acc] autosave wait (%@): 未確立", why); return; }
+        done = YES;
         acc_snapshot(name);
-        acc_set_current_label(name);   // 複垢：保存した新垢を今アクティブなラベルにする
+        acc_set_current_label(name);
         [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_autosave_name.txt") error:nil];
-        L(@"[acc] auto-saved new account as: %@", name);
+        L(@"[acc] auto-saved '%@' (%@)", name, why);
     };
-    // アプリをバックグラウンドにした時、または30秒後（先着）に保存
+
+    // バックグラウンド化時（確立済みなら保存）
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil
                      queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *n){ doSave(); }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ doSave(); });
+                usingBlock:^(NSNotification *n){ trySave(@"background"); }];
+
+    // 確立するまで 3秒ごと・最大120秒ポーリング（__block で自己保持し、終了時に nil でサイクルを断つ）
+    __block int ticks = 0;
+    __block void (^poll)(void) = nil;
+    poll = ^{
+        if (done) { poll = nil; return; }
+        trySave(@"poll");
+        if (done) { poll = nil; return; }
+        if (++ticks >= 40) {   // 120秒待っても未確立
+            L(@"[acc] autosave: 120秒経っても未確立。次回起動時に再試行します（名前: %@）", name);
+            poll = nil; return;
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), poll);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), poll);
 }
 
 // セッション/ユーザー系の prefs キーだけ消す（オンボーディング/設定は残す）
@@ -318,22 +348,73 @@ static void acc_dump_pref_keys(void) {
     [s writeToFile:docs_path(@"prefs_dump.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
-// ==== 新規アカ自動作成：オンボーディングの「はじめる」を自動タップ ====
+// ==== 新規アカ自動作成：ニックネーム自動入力＋「作成」を自動タップ ====
+// 前面のキーウィンドウから最初の UITextField を再帰的に探す
+static UITextField *onbo_find_textfield(UIView *v) {
+    if ([v isKindOfClass:UITextField.class] && !v.hidden) return (UITextField *)v;
+    for (UIView *sub in v.subviews) {
+        UITextField *tf = onbo_find_textfield(sub);
+        if (tf) return tf;
+    }
+    return nil;
+}
+static UIView *onbo_top_view(id fallbackVC) {
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if ([sc isKindOfClass:UIWindowScene.class] &&
+            sc.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *w in ((UIWindowScene *)sc).windows)
+                if (w.isKeyWindow) return w;
+        }
+    }
+    @try { return [fallbackVC view]; } @catch (__unused NSException *e) { return nil; }
+}
 static void (*g_orig_onbo_vda)(id, SEL, BOOL) = NULL;
 static void my_onbo_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (g_orig_onbo_vda) g_orig_onbo_vda(self, _cmd, animated);
     if (![[NSFileManager defaultManager] fileExistsAtPath:docs_path(@"AUTO_CREATE")]) return;
-    [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"AUTO_CREATE") error:nil];  // 一度だけ
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
+    [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"AUTO_CREATE") error:nil];  // 消費（一度だけ）
+    // 入力したいニックネーム（名前つき作成で書かれる）。無ければ空。
+    NSString *nick = [[NSString stringWithContentsOfFile:docs_path(@"_create_name.txt")
+                                                encoding:NSUTF8StringEncoding error:nil]
+                      stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    // ボタン未生成／名前欄未表示に備え、押せるまで 0.5秒ごとに最大~20秒リトライ。
+    // 各回：まず名前欄にニックネームを入れて editingChanged を発火 → 作成ボタンをタップ。
+    __weak id wself = self;
+    __block int tries = 0;
+    __block BOOL filled = NO;
+    __block void (^tap)(void) = nil;
+    tap = ^{
+        id s = wself;
+        if (!s) { tap = nil; return; }
         @try {
+            // 1) ニックネームを名前欄へ（一度入れられたら以後は維持）
+            if (nick.length && !filled) {
+                UITextField *tf = onbo_find_textfield(onbo_top_view(s));
+                if (tf) {
+                    tf.text = nick;
+                    [tf sendActionsForControlEvents:UIControlEventEditingChanged];
+                    [tf sendActionsForControlEvents:UIControlEventValueChanged];
+                    filled = YES;
+                    L(@"[acc] nickname filled: %@", nick);
+                }
+            }
+            // 2) 作成ボタンをタップ（名前必須なら 1) で有効化されてから通る）
             SEL sel = NSSelectorFromString(@"createAccountButton");
-            if (![self respondsToSelector:sel]) { L(@"[acc] no createAccountButton"); return; }
-            UIButton *b = ((UIButton *(*)(id, SEL))objc_msgSend)(self, sel);
-            [b sendActionsForControlEvents:UIControlEventTouchUpInside];
-            L(@"[acc] auto-tapped createAccount (button=%@)", b);
-        } @catch (NSException *e) { L(@"[acc] auto-tap failed: %@", e); }
-    });
+            UIButton *b = [s respondsToSelector:sel] ? ((UIButton *(*)(id, SEL))objc_msgSend)(s, sel) : nil;
+            BOOL ready = (nick.length == 0) || filled;   // 名前入力方式なら埋めてから押す
+            if (b && ready) {
+                [b sendActionsForControlEvents:UIControlEventTouchUpInside];
+                L(@"[acc] auto-tapped createAccount (try %d, nick=%@)", tries, nick.length ? nick : @"(none)");
+                [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_create_name.txt") error:nil];
+                tap = nil; return;
+            }
+        } @catch (NSException *e) { L(@"[acc] auto-create ex: %@", e); }
+        if (++tries >= 40) { L(@"[acc] auto-create: 名前欄/ボタンが見つからず断念"); tap = nil; return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), tap);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), tap);
 }
 static void install_onbo_autocreate(void) {
     static BOOL done = NO; if (done) return;
@@ -586,8 +667,32 @@ static void gui_accounts_remove_label(NSString *label) {
     if (out) [out writeToFile:path atomically:YES];
 }
 
+// 現在画面の UI 階層を文字列化（名前欄/ボタンの場所特定用）
+static void ui_dump_tree(UIView *v, NSMutableString *s, int depth) {
+    NSMutableString *ind = [NSMutableString string];
+    for (int i = 0; i < depth; i++) [ind appendString:@"  "];
+    NSString *extra = @"";
+    if ([v isKindOfClass:UITextField.class]) {
+        UITextField *tf = (UITextField *)v;
+        extra = [NSString stringWithFormat:@"  <TF placeholder='%@' text='%@'>", tf.placeholder ?: @"", tf.text ?: @""];
+    } else if ([v isKindOfClass:UITextView.class]) {
+        extra = [NSString stringWithFormat:@"  <TV text='%@'>", [(UITextView *)v text] ?: @""];
+    } else if ([v isKindOfClass:UIButton.class]) {
+        UIButton *b = (UIButton *)v;
+        extra = [NSString stringWithFormat:@"  <BTN title='%@' enabled=%d>", [b titleForState:UIControlStateNormal] ?: @"", b.enabled];
+    } else if ([v isKindOfClass:UILabel.class]) {
+        NSString *t = [(UILabel *)v text] ?: @"";
+        if (t.length > 40) t = [[t substringToIndex:40] stringByAppendingString:@"…"];
+        extra = [NSString stringWithFormat:@"  <LBL '%@'>", t];
+    }
+    [s appendFormat:@"%@%@ (%.0f,%.0f %.0fx%.0f) hidden=%d%@\n", ind, NSStringFromClass(v.class),
+        v.frame.origin.x, v.frame.origin.y, v.frame.size.width, v.frame.size.height, v.hidden, extra];
+    for (UIView *sub in v.subviews) ui_dump_tree(sub, s, depth + 1);
+}
+
 @interface MRVBGTool : UIViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property(nonatomic,strong) UIButton *btn;
+- (void)dumpUI;
 - (void)multiToolMenu;
 - (void)giftFlow;
 - (void)enterFlow;
@@ -647,6 +752,7 @@ static void gui_accounts_remove_label(NSString *label) {
     [ac addAction:[UIAlertAction actionWithTitle:@"🔄 新規アカにする（自動ログイン）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self lightNewNow]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🆕 新規アカ作成（名前つき保存）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self newAccountNamed]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🚀 複垢ツール（送信/ミッション）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self multiToolMenu]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🧭 画面ダンプ（UI階層）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self dumpUI]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🌐 通信ログ（gift/send捕捉）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self netLogMenu]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"🧹 完全初期化（トラブル時）" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x){ [self deviceResetNow]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
@@ -681,6 +787,7 @@ static void gui_accounts_remove_label(NSString *label) {
         if (k > sub_seq_get()) sub_seq_set(k);
         [[NSData data] writeToFile:docs_path(@"NEW_LIGHT") atomically:YES];           // 新UUID＋セッション消去
         [[NSData data] writeToFile:docs_path(@"AUTO_CREATE") atomically:YES];         // 「はじめる」自動タップ
+        [name writeToFile:docs_path(@"_create_name.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];   // 作成時のニックネームに使う
         [name writeToFile:docs_path(@"_autosave_name.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil]; // 起動後に自動保存
         [self confirmRelaunch:[NSString stringWithFormat:@"開き直すと新規アカを自動作成し、少し使うと自動で「%@」に保存します。", name]];
     }]];
@@ -698,6 +805,23 @@ static void gui_accounts_remove_label(NSString *label) {
     [ac addAction:[UIAlertAction actionWithTitle:(on?@"差し替えを OFF にする":@"差し替えを ON にする") style:on?UIAlertActionStyleDestructive:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self setSwap:!on]; }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"閉じる" style:UIAlertActionStyleCancel handler:nil]];
     [self present:ac];
+}
+// 現在画面の VC/View 階層を Documents/ui_dump.txt に保存（名前入力欄の場所特定用）
+- (void)dumpUI {
+    UIViewController *vc = bg_top_vc();
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"time: %@\n", [NSDate date]];
+    [s appendFormat:@"top VC: %@\n", vc ? NSStringFromClass(vc.class) : @"(nil)"];
+    // present チェーンも記録
+    UIViewController *p = vc.presentingViewController;
+    while (p) { [s appendFormat:@"  presenting <- %@\n", NSStringFromClass(p.class)]; p = p.presentingViewController; }
+    UIView *rv = vc.view ?: onbo_top_view(nil);
+    [s appendString:@"\n== view hierarchy ==\n"];
+    if (rv) ui_dump_tree(rv, s, 0); else [s appendString:@"(no view)\n"];
+    [s writeToFile:docs_path(@"ui_dump.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    L(@"[ui] dumped -> Documents/ui_dump.txt (top=%@)", vc ? NSStringFromClass(vc.class) : @"nil");
+    [self alert:@"UIダンプ保存" msg:[NSString stringWithFormat:@"現在画面（%@）の構造を Documents/ui_dump.txt に保存しました。",
+        vc ? NSStringFromClass(vc.class) : @"?"]];
 }
 // ==== 複垢ツール UI ====
 - (void)askText:(NSString *)title placeholder:(NSString *)ph completion:(void (^)(NSString *))cb {
@@ -890,7 +1014,8 @@ static void gui_accounts_remove_label(NSString *label) {
         for (NSString *s in slots)
             if ([fm removeItemAtPath:acc_slot(s) error:nil]) n++;
         [fm removeItemAtPath:docs_path(@"mirrativ_accounts.json") error:nil];   // JSONも丸ごとクリア
-        [self alert:@"削除しました" msg:[NSString stringWithFormat:@"%lu 件のスロットと accounts.json を削除しました。", (unsigned long)n]];
+        [fm removeItemAtPath:docs_path(@"_sub_seq.txt") error:nil];             // 自動採番もリセット（次はサブ1）
+        [self alert:@"削除しました" msg:[NSString stringWithFormat:@"%lu 件のスロットと accounts.json を削除し、自動採番もリセットしました。", (unsigned long)n]];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
     [self present:a];
