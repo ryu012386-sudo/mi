@@ -124,6 +124,12 @@ static NSString *read_keychain_uuid(void);
 static NSString *read_mr_cookie(void);
 // 新規垢の年齢＋名前を API で設定（profile_edit）。実体は下部で定義。
 static void set_new_account_profile(NSString *name);
+// GUI用の現在垢設定(dict)を組む／全スロットから accounts.json を再構築。実体は下部で定義。
+static NSDictionary *gui_build_cfg(void);
+static void gui_rebuild_accounts(void);
+static NSString *device_model(void);
+// 切替なしで旧スロットの mr_id を /me から取得して gui.json/accounts.json に反映。実体は下部。
+static void gui_backfill_slots(void);
 // 新規垢が確立したか（device UUID が keychain にあり、mr_id cookie も付いた）
 static BOOL acc_is_established(void) {
     NSString *kc = read_keychain_uuid();
@@ -220,7 +226,13 @@ static void acc_snapshot(NSString *name) {
     if ([fm fileExistsAtPath:docs_path(@"fake_idfv.txt")])
         [fm copyItemAtPath:docs_path(@"fake_idfv.txt")
                     toPath:[slot stringByAppendingPathComponent:@"fake_idfv.txt"] error:nil];
+    // GUI用の設定(mr_id含む)をスロット内にも保存 → accounts.json を全スロットから再構築できる
+    NSMutableDictionary *g = [gui_build_cfg() mutableCopy];
+    g[@"label"] = name;
+    NSData *gd = [NSJSONSerialization dataWithJSONObject:g options:NSJSONWritingPrettyPrinted error:nil];
+    if (gd) [gd writeToFile:[slot stringByAppendingPathComponent:@"gui.json"] atomically:YES];
     L(@"[acc] snapshot saved (cfprefsd): %@", name);
+    gui_rebuild_accounts();   // スロット全体から accounts.json を作り直して同期
 }
 static BOOL acc_restore(NSString *name) {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -280,18 +292,20 @@ static void acc_schedule_autosave(void) {
         if (done) return;
         if (!acc_is_established()) { L(@"[acc] autosave wait (%@): 未確立", why); return; }
         done = YES;
-        // 垢が確立したら、入力名を API で設定（year/birthday＋profile_edit の name）
-        NSString *nick = [[NSString stringWithContentsOfFile:docs_path(@"_create_name.txt")
-                                                    encoding:NSUTF8StringEncoding error:nil]
-                          stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (nick.length) {
-            set_new_account_profile(nick);
-            [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_create_name.txt") error:nil];
-        }
-        acc_snapshot(name);
-        acc_set_current_label(name);
-        [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_autosave_name.txt") error:nil];
-        L(@"[acc] auto-saved '%@' (%@)", name, why);
+        // 通信同期待ちでメインを固めないよう、確立後の処理はバックグラウンドで
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSString *nick = [[NSString stringWithContentsOfFile:docs_path(@"_create_name.txt")
+                                                        encoding:NSUTF8StringEncoding error:nil]
+                              stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (nick.length) {
+                set_new_account_profile(nick);   // 年齢＋名前を API 設定（/meで検証・リトライ付き）
+                [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_create_name.txt") error:nil];
+            }
+            acc_snapshot(name);
+            acc_set_current_label(name);
+            [[NSFileManager defaultManager] removeItemAtPath:docs_path(@"_autosave_name.txt") error:nil];
+            L(@"[acc] auto-saved '%@' (%@)", name, why);
+        });
     };
 
     // バックグラウンド化時（確立済みなら保存）
@@ -1000,6 +1014,16 @@ static void ui_dump_tree(UIView *v, NSMutableString *s, int depth) {
         message:[NSString stringWithFormat:@"保存済み: %lu 個。切替はアプリ再起動で反映。", (unsigned long)slots.count]
         preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"＋ 今のアカウントを保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self accSave]; }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🔧 旧スロットを一括取込（切替不要）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            gui_backfill_slots();   // 各スロットの device UUID で /me → mr_id を取得して反映
+            [self showResult:@"取込完了" body:@"全スロットの device UUID から /me で mr_id を取得し、accounts.json に反映しました。\n（詳細ログは Documents の NSLog / uuidreset を参照）"];
+        });
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"🔄 JSON再構築（既存 gui.json から）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){
+        gui_rebuild_accounts();
+        [self alert:@"再構築しました" msg:@"全スロットの gui.json から mirrativ_accounts.json を作り直しました。"];
+    }]];
     for (NSString *n in slots) {
         [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"▶ 「%@」に切替", n] style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){ [self accSwitch:n]; }]];
     }
@@ -1366,20 +1390,19 @@ static void gui_write_accounts(NSDictionary *cfg, NSString *label) {
     if (jd) [jd writeToFile:path atomically:YES];
     L(@"[gui] accounts upsert label=%@ total=%lu", entry[@"label"], (unsigned long)accts.count);
 }
-static void dump_gui_config(void) {
+// 現在アクティブな垢の GUI 設定(dict)を組む（dump_gui_config / acc_snapshot 共用）
+static NSDictionary *gui_build_cfg(void) {
     NSString *SUITE = @"group.com.dena.mirrativ.shared";
     NSString *kc  = read_keychain_uuid();
     NSString *std = [[NSUserDefaults standardUserDefaults] stringForKey:@"deviceUUID"];
     NSString *grp = [[[NSUserDefaults alloc] initWithSuiteName:SUITE] stringForKey:@"deviceUUID"];
-    NSString *device_id = grp ?: (kc ?: std);   // 実効 device_id（getUUID の優先順）
+    NSString *device_id = grp ?: (kc ?: std);
     NSString *idfv  = g_fakeIDFV ?: [[[UIDevice currentDevice] identifierForVendor] UUIDString];
     NSString *ver   = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
     NSString *os    = [[UIDevice currentDevice] systemVersion];
     NSString *model = device_model();
     NSString *mr_id = read_mr_cookie();
-
-    // GUI の DEFAULTS キーに一致させる。値が無い項目は空文字（GUI 側で既定を残せる）。
-    NSDictionary *cfg = @{
+    return @{
         @"device_id": device_id ?: @"",
         @"mr_id":     mr_id     ?: @"",
         @"idfv":      idfv      ?: @"",
@@ -1387,6 +1410,116 @@ static void dump_gui_config(void) {
         @"model":     model     ?: @"",
         @"os_ver":    os        ?: @"",
     };
+}
+// 全スロットの gui.json ＋ 既存 accounts.json をマージして accounts.json を再構築（mr_id でdedupe）
+static void gui_rebuild_accounts(void) {
+    NSString *path = docs_path(@"mirrativ_accounts.json");
+    NSMutableDictionary<NSString *, NSDictionary *> *byMr = [NSMutableDictionary dictionary];
+    // 既存 accounts.json（スロットに無いアクティブ収集分を保持）
+    NSData *old = [NSData dataWithContentsOfFile:path];
+    if (old) {
+        id root = [NSJSONSerialization JSONObjectWithData:old options:0 error:nil];
+        id arr = [root isKindOfClass:NSDictionary.class] ? root[@"accounts"] : root;
+        if ([arr isKindOfClass:NSArray.class])
+            for (id e in arr) {
+                NSString *mr = [e isKindOfClass:NSDictionary.class] ? e[@"mr_id"] : nil;
+                if ([mr isKindOfClass:NSString.class] && mr.length) byMr[mr] = e;
+            }
+    }
+    // 各スロットの gui.json（＝保存時点の設定・mr_id含む）。スロット名を label に。
+    for (NSString *n in acc_list()) {
+        NSData *d = [NSData dataWithContentsOfFile:[acc_slot(n) stringByAppendingPathComponent:@"gui.json"]];
+        if (!d) continue;
+        id e = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (![e isKindOfClass:NSDictionary.class]) continue;
+        NSString *mr = e[@"mr_id"];
+        if (![mr isKindOfClass:NSString.class] || !mr.length) continue;
+        NSMutableDictionary *m = [e mutableCopy];
+        m[@"label"] = n;   // スロット名を正としてラベル付け
+        byMr[mr] = m;
+    }
+    NSArray *accts = [byMr allValues];
+    NSData *outd = [NSJSONSerialization dataWithJSONObject:@{ @"accounts": accts }
+                                                  options:NSJSONWritingPrettyPrinted error:nil];
+    if (outd) [outd writeToFile:path atomically:YES];
+    L(@"[gui] accounts rebuilt: %lu 垢 (slots=%lu + existing)",
+      (unsigned long)accts.count, (unsigned long)acc_list().count);
+}
+// スロットの keychain.plist から device UUID を取り出す
+static NSString *acc_slot_device_uuid(NSString *name) {
+    NSArray *kc = [NSArray arrayWithContentsOfFile:[acc_slot(name) stringByAppendingPathComponent:@"keychain.plist"]];
+    for (NSDictionary *e in kc) {
+        if ([e[@"acct"] isEqual:@"com.dena.mirrativ.uuid"] && [e[@"data"] isKindOfClass:NSData.class]) {
+            NSString *s = [[[NSString alloc] initWithData:e[@"data"] encoding:NSUTF8StringEncoding]
+                           stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (s.length) return s;
+        }
+    }
+    return nil;
+}
+static NSString *acc_slot_idfv(NSString *name) {
+    NSString *s = [NSString stringWithContentsOfFile:[acc_slot(name) stringByAppendingPathComponent:@"fake_idfv.txt"]
+                                            encoding:NSUTF8StringEncoding error:nil];
+    return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+}
+// device UUID(＋idfv) で /me を叩き、返ってきた mr_id を取得（切替せず既存垢のセッションを再発行）
+static NSString *mrv_fetch_mr_for_uuid(NSString *uuid, NSString *idfv) {
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];  // 独自cookie storage
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://www.mirrativ.com/api/user/me"]];
+    NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
+    NSString *os  = [[UIDevice currentDevice] systemVersion] ?: @"";
+    [req setValue:[NSString stringWithFormat:@"MR_APP/%@/iOS/%@/%@", ver, device_model(), os] forHTTPHeaderField:@"User-Agent"];
+    [req setValue:uuid forHTTPHeaderField:@"x-uuid"];
+    [req setValue:(idfv ?: @"") forHTTPHeaderField:@"x-idfv"];
+    [req setValue:@"splash" forHTTPHeaderField:@"x-referer"];
+    [req setValue:[NSString stringWithFormat:@"%.6f", [[NSDate date] timeIntervalSince1970]] forHTTPHeaderField:@"x-client-unixtime"];
+    NSURLSession *sess = [NSURLSession sessionWithConfiguration:cfg];
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[sess dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
+    for (NSHTTPCookie *c in cfg.HTTPCookieStorage.cookies) {
+        if ([c.domain rangeOfString:@"mirrativ" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+        if ([c.name caseInsensitiveCompare:@"mr_id"] == NSOrderedSame) return c.value;
+    }
+    return nil;
+}
+// 切替なし一括：gui.json/mr_id が無いスロットを /me で補完 → accounts.json 再構築
+static void gui_backfill_slots(void) {
+    NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
+    NSString *os  = [[UIDevice currentDevice] systemVersion] ?: @"";
+    NSString *model = device_model();
+    int done = 0, skip = 0, fail = 0;
+    for (NSString *n in acc_list()) {
+        NSString *gp = [acc_slot(n) stringByAppendingPathComponent:@"gui.json"];
+        NSData *ex = [NSData dataWithContentsOfFile:gp];
+        if (ex) {
+            id e = [NSJSONSerialization JSONObjectWithData:ex options:0 error:nil];
+            if ([e isKindOfClass:NSDictionary.class] && [e[@"mr_id"] isKindOfClass:NSString.class] && [e[@"mr_id"] length]) { skip++; continue; }
+        }
+        NSString *uuid = acc_slot_device_uuid(n);
+        if (!uuid.length) { fail++; L(@"[gui] backfill %@: device uuid 不明", n); continue; }
+        NSString *idfv = acc_slot_idfv(n);
+        NSString *mr = mrv_fetch_mr_for_uuid(uuid, idfv);
+        if (!mr.length) { fail++; L(@"[gui] backfill %@: mr_id 取得失敗", n); continue; }
+        NSDictionary *g = @{ @"device_id": uuid, @"mr_id": mr, @"idfv": (idfv ?: @""),
+                             @"app_ver": ver, @"model": model, @"os_ver": os, @"label": n };
+        NSData *gd = [NSJSONSerialization dataWithJSONObject:g options:NSJSONWritingPrettyPrinted error:nil];
+        if (gd) [gd writeToFile:gp atomically:YES];
+        done++;
+    }
+    gui_rebuild_accounts();
+    L(@"[gui] backfill done=%d skip=%d fail=%d", done, skip, fail);
+}
+static void dump_gui_config(void) {
+    NSDictionary *cfg = gui_build_cfg();
+    NSString *device_id = cfg[@"device_id"];
+    NSString *mr_id = cfg[@"mr_id"];
+    NSString *idfv  = cfg[@"idfv"];
+    NSString *ver   = cfg[@"app_ver"];
+    NSString *os    = cfg[@"os_ver"];
+    NSString *model = cfg[@"model"];
 
     NSError *je = nil;
     NSData *jd = [NSJSONSerialization dataWithJSONObject:cfg
@@ -1412,10 +1545,22 @@ static void dump_gui_config(void) {
     [s writeToFile:docs_path(@"mirrativ_gui.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
     // 複垢蓄積：アクティブ垢を mirrativ_accounts.json に upsert（現在のスロット名でラベル）
-    gui_write_accounts(cfg, acc_current_label());
+    NSString *label = acc_current_label();
+    gui_write_accounts(cfg, label);
+
+    // 現在アクティブなスロットの gui.json を最新化（＝旧スロットも使えば再構築で拾える）
+    if (label.length && mr_id.length) {
+        NSString *slot = acc_slot(label); BOOL d = NO;
+        if ([[NSFileManager defaultManager] fileExistsAtPath:slot isDirectory:&d] && d) {
+            NSMutableDictionary *g = [cfg mutableCopy];
+            g[@"label"] = label;
+            NSData *gd = [NSJSONSerialization dataWithJSONObject:g options:NSJSONWritingPrettyPrinted error:nil];
+            if (gd) [gd writeToFile:[slot stringByAppendingPathComponent:@"gui.json"] atomically:YES];
+        }
+    }
 
     L(@"[gui] config -> Documents/mirrativ_gui.json (mr_id=%@)",
-      mr_id ? @"present" : @"none");
+      mr_id.length ? @"present" : @"none");
 }
 
 // ==== 通信ロガー：アプリ実物の gift/send 等リクエストを丸ごと吐く ====
@@ -1571,6 +1716,8 @@ static void reset_gate(void) {
         dump_cookies();
         // GUI(mirrativ_gui.py)の入力フィールドの中身を1ファイルに集約して吐く
         dump_gui_config();
+        // 起動ごとに全スロットから accounts.json を再構築（スロットとJSONのズレを解消）
+        gui_rebuild_accounts();
 
         // 状態を Documents に追記（ログ不要の確認用）
         NSString *line = [NSString stringWithFormat:@"%@  armed=%d fakeIDFV=%@ bundleID=%@\n",
